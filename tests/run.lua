@@ -12,6 +12,7 @@ local current_doc = nil
 local current_settings = {}
 local notifications = {}
 local updated_text = nil
+local updated_selection = nil
 local update_result = true
 
 local function reset_luban()
@@ -19,6 +20,7 @@ local function reset_luban()
   current_settings = {}
   notifications = {}
   updated_text = nil
+  updated_selection = nil
   update_result = true
   luban = {
     log = function(level, message) end,
@@ -28,8 +30,9 @@ local function reset_luban()
     get_document = function()
       return current_doc
     end,
-    set_document_text = function(text)
+    set_document_text = function(text, start, finish)
       updated_text = text
+      updated_selection = { start, finish }
       if update_result then
         return true
       end
@@ -307,6 +310,7 @@ test("minifies the document", function()
   notifications = {}
   M.minify_document({})
   eq(updated_text, '{"b":1,"a":[true,null]}')
+  truthy(updated_selection[1] == 0 and updated_selection[2] == 0, "cursor should move to the document start")
   contains(notifications[#notifications], "JSON minified")
 end)
 

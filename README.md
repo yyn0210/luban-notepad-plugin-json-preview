@@ -48,7 +48,8 @@ The plugin is a single sandboxed Lua file and requests no permissions.
 命令可从命令面板或“插件”菜单执行；快捷键可在快捷键编辑器中修改。
 
 - 格式化保留原始键顺序和重复键，不会自动排序；排序只影响预览。
-- 格式化/压缩通过 `luban.set_document_text` 修改文档，可撤销并走正常保存流程。
+- 格式化/压缩通过 `luban.set_document_text` 修改文档，可撤销并走正常保存流程；
+  完成后光标回到文档开头。
 - 面板标题显示当前文件名；切换标签或编辑后自动跟随。
 - 面板上“刷新”可手动重算，“关闭”关闭面板。
 

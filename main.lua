@@ -1237,7 +1237,7 @@ local function update_document(command, output)
     notify(command .. ": this host cannot update documents.")
     return false
   end
-  local ok, err = luban.set_document_text(output)
+  local ok, err = luban.set_document_text(output, 0, 0)
   if ok == false or (ok == nil and err ~= nil) then
     notify(command .. ": " .. tostring(err or "cannot update the document"))
     return false

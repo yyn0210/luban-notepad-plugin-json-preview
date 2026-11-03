@@ -1,7 +1,7 @@
 {
   "id": "io.github.yyn0210.json-preview",
   "name": "JSON Preview",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "api_version": 1,
   "main": "main.lua",
   "description": "Tree-style JSON preview in a side panel with syntax colors, error locations, duplicate-key hints, JSON Lines support and format/minify commands.",
