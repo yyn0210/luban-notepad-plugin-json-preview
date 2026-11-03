@@ -275,7 +275,7 @@ end)
 
 test("renders a tree with theme roles and a summary", function()
   local panel = render('{"name":"x","count":2,"ok":true,"nothing":null,"items":[1]}')
-  contains(panel.lines[1].text, "Object · 5 keys")
+  truthy(index_of(panel, "Object · 5 keys") ~= nil, "summary missing")
   local key_line = panel.lines[index_of(panel, '"name"')]
   truthy(role_has(key_line, "property", '"name"'), "key role missing")
   truthy(role_has(key_line, "string", '"x"'), "string role missing")
@@ -400,13 +400,13 @@ end)
 
 test("normalizes CRLF and a UTF-8 BOM", function()
   local panel = render("\239\187\191{\r\n  \"a\": 1\r\n}\r\n")
-  contains(panel.lines[1].text, "Object · 1 key")
+  truthy(index_of(panel, "Object · 1 key") ~= nil, "summary missing")
   truthy(index_of(panel, '"a": 1') ~= nil, "value missing")
 end)
 
 test("detects JSON Lines when every non-empty line is valid", function()
   local panel = render('{"a":1}\n{"b":[2,3]}\n\n{"c":true}\n')
-  contains(panel.lines[1].text, "JSON Lines · 3 records")
+  truthy(index_of(panel, "JSON Lines · 3 records") ~= nil, "summary missing")
   truthy(index_of(panel, "Line 1 · Object · 1 key") ~= nil, "record 1 header missing")
   truthy(index_of(panel, "Line 2 · Object · 1 key") ~= nil, "record 2 header missing")
   truthy(index_of(panel, "Line 4 · Object · 1 key") ~= nil, "record 3 header missing")
@@ -482,13 +482,107 @@ local function any_notification(needle)
   return false
 end
 
+test("puts preview actions in the panel toolbar, not the Plugins menu", function()
+  local file = assert(io.open("plugin.json", "rb"))
+  local text = file:read("*a")
+  file:close()
+  for _, id in ipairs({
+    "json.fold.toggle",
+    "json.fold.all",
+    "json.fold.none",
+    "json.fold.toggle-all",
+    "json.path.show",
+    "json.path.extract",
+    "json.path.action",
+    "json.metadata",
+  }) do
+    contains(text, '"id": "' .. id .. '"', "missing command " .. id)
+  end
+  local menu_start = assert(text:find('"menus"', 1, true))
+  local menu_end = assert(text:find("]", menu_start, true))
+  local menus = text:sub(menu_start, menu_end)
+  for _, id in ipairs({
+    "json.fold.toggle",
+    "json.fold.all",
+    "json.fold.none",
+    "json.path.show",
+    "json.path.extract",
+    "json.metadata",
+  }) do
+    truthy(not menus:find('"' .. id .. '"', 1, true), "feature command should not be in the Plugins menu: " .. id)
+  end
+  contains(menus, '"json.preview"', "preview menu entry missing")
+end)
+
+test("renders the three action rows and toggles all folds", function()
+  local text = '{"a":{"b":1},"c":[1,2]}'
+  local panel = render(text)
+  eq(panel.lines[1].command, "json.fold.all")
+  contains(panel.lines[1].text, "[ Fold All ]")
+  eq(panel.lines[2].command, "json.path.action")
+  contains(panel.lines[2].text, "[ Show / Extract ]")
+  eq(panel.lines[3].command, "json.metadata")
+  contains(panel.lines[3].text, "[ Analyze ]")
+  eq(panel.lines[4].style, "rule")
+  current_doc = {
+    path = "/tmp/test.json",
+    text = text,
+    line = 1,
+    column = 6,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  notifications = {}
+  M.toggle_all_folds({})
+  truthy(any_notification("folded 2 nodes"), "toggle-all fold notification missing")
+  local folded = M.render_preview({})
+  contains(folded.lines[1].text, "[ Expand All ]")
+  eq(folded.lines[1].command, "json.fold.none")
+  truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "nested node was not folded")
+  M.toggle_all_folds({})
+  local expanded = M.render_preview({})
+  contains(expanded.lines[1].text, "[ Fold All ]")
+  truthy(index_of(expanded, "▸") == nil, "toggle-all did not expand")
+end)
+
+test("the toolbar JSONPath action follows the editor selection", function()
+  local expression = "$.users[0].name"
+  local text = '{"query":"' .. expression .. '","users":[{"name":"Ada"}]}'
+  local byte_start = assert(text:find(expression, 1, true))
+  local start_char = utf8.len(text:sub(1, byte_start - 1))
+  current_doc = {
+    path = "/tmp/action.json",
+    text = text,
+    line = 1,
+    column = 1,
+    selection_start = start_char,
+    selection_end = start_char + #expression,
+  }
+  current_settings = {}
+  notifications = {}
+  M.jsonpath_action({})
+  eq(I.inspector_state.mode, "jsonpath")
+  eq(I.inspector_state.expression, expression)
+  local starts = I.compute_line_starts(text)
+  local position = assert(text:find("Ada", 1, true))
+  local location = I.locate(text, starts, position)
+  current_doc.selection_start = 0
+  current_doc.selection_end = 0
+  current_doc.line = location.line
+  current_doc.column = location.column
+  notifications = {}
+  M.jsonpath_action({})
+  eq(I.inspector_state.mode, "path")
+  eq(I.inspector_state.path, "$.users[0].name")
+end)
+
 test("the rich fixture keeps every invariant", function()
   local file = assert(io.open("tests/fixtures/complex.json", "rb"))
   local text = file:read("*a")
   file:close()
   local panel = render(text)
   truthy(#panel.lines > 20, "fixture produced too few lines")
-  contains(panel.lines[1].text, "Object")
+  truthy(index_of(panel, "Object") ~= nil, "summary missing")
   truthy(index_of(panel, '"users"') ~= nil, "fixture users missing")
   truthy(index_of(panel, '"roles"') ~= nil, "fixture roles missing")
 end)
@@ -512,7 +606,7 @@ test("folds and expands the node containing the cursor", function()
   local folded = M.render_preview({})
   check_panel(folded)
   truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "collapsed line missing")
-  contains(folded.lines[1].text, "1 folded")
+  truthy(index_of(folded, "1 folded") ~= nil, "folded summary missing")
   notifications = {}
   M.toggle_fold({})
   truthy(any_notification("expanded $.a"), "expand notification missing")
@@ -705,7 +799,7 @@ end)
 test("folds, analyzes and queries JSON Lines records", function()
   local text = '{"a":1}\n{"b":{"c":2}}\n'
   local panel = render(text)
-  contains(panel.lines[1].text, "JSON Lines · 2 records")
+  truthy(index_of(panel, "JSON Lines · 2 records") ~= nil, "summary missing")
   current_doc = {
     path = "/tmp/test.json",
     text = text,

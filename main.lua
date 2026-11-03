@@ -1148,6 +1148,50 @@ local function push_line(renderer, line)
   return true
 end
 
+-- Panel lines can carry a command, so the preview starts with three clickable
+-- action rows. The host closes a panel before running the clicked command; the
+-- fold commands reopen the preview, and the inspector commands replace it.
+local function toolbar_line(prefix, action, command, hint)
+  local spans = {
+    { text = prefix .. "  ", style = "muted" },
+    { text = action, style = "bold" },
+  }
+  local text = prefix .. "  " .. action
+  if hint then
+    local tail = "  ·  " .. hint
+    text = text .. tail
+    spans[#spans + 1] = { text = tail, style = "muted" }
+  end
+  return { text = text, style = "list", command = command, spans = spans }
+end
+
+local function render_toolbar(folded)
+  local lines = {}
+  if folded > 0 then
+    lines[#lines + 1] = toolbar_line(
+      "Folding", "[ Expand All ]", "json.fold.none", "Ctrl+Alt+J folds at cursor"
+    )
+  else
+    lines[#lines + 1] = toolbar_line(
+      "Folding", "[ Fold All ]", "json.fold.all", "Ctrl+Alt+J folds at cursor"
+    )
+  end
+  lines[#lines + 1] = toolbar_line(
+    "JSONPath", "[ Show / Extract ]", "json.path.action", "path at cursor or selected expression"
+  )
+  lines[#lines + 1] = toolbar_line("Metadata", "[ Analyze ]", "json.metadata")
+  lines[#lines + 1] = { text = "", style = "rule" }
+  return lines
+end
+
+local function push_toolbar(renderer, folded)
+  for _, line in ipairs(render_toolbar(folded)) do
+    if not push_line(renderer, line) then
+      return
+    end
+  end
+end
+
 local function duplicate_note(pair, line_for_pos)
   local first_line = nil
   if line_for_pos and pair.duplicate_of then
@@ -1343,6 +1387,7 @@ local function render_valid(text, root, opts, roots)
   if folded > 0 then
     summary = summary .. " · " .. folded .. " folded"
   end
+  push_toolbar(renderer, folded)
   push_line(renderer, { text = summary, style = "muted" })
   local starts = compute_line_starts(text)
   local function line_for_pos(pos)
@@ -1381,6 +1426,7 @@ local function render_json_lines(text, records, opts, roots)
   if folded > 0 then
     summary = summary .. " · " .. folded .. " folded"
   end
+  push_toolbar(renderer, folded)
   push_line(renderer, { text = summary, style = "muted" })
   for _, record in ipairs(records) do
     local record_summary = string.format(
@@ -2727,6 +2773,49 @@ function M.expand_all(ctx)
   expand_all()
   M.open_preview(ctx)
   notify("JSON: expanded all nodes.")
+end
+
+function M.toggle_all_folds(ctx)
+  local analysis = analysis_document("JSON: cannot fold")
+  if not analysis then
+    return
+  end
+  ensure_fold_state(analysis.doc, analysis.roots, preview_options().fold_level)
+  local folded = 0
+  for _, root in ipairs(analysis.roots) do
+    folded = folded + count_visible_folded(root.node, root.fold_prefix or "$", fold_state.collapsed)
+  end
+  if folded > 0 then
+    expand_all()
+    M.open_preview(ctx)
+    notify("JSON: expanded all nodes.")
+  else
+    fold_all(analysis.roots)
+    M.open_preview(ctx)
+    if fold_state.count > 0 then
+      notify(string.format("JSON: folded %d nodes.", fold_state.count))
+    else
+      notify("JSON: there are no nested objects or arrays to fold.")
+    end
+  end
+end
+
+function M.jsonpath_action(ctx)
+  local doc = active_document()
+  local has_selection = false
+  if doc
+    and type(doc.text) == "string"
+    and type(doc.selection_start) == "number"
+    and type(doc.selection_end) == "number"
+    and doc.selection_end > doc.selection_start
+  then
+    has_selection = trim(sub_chars(doc.text, doc.selection_start, doc.selection_end)) ~= ""
+  end
+  if has_selection then
+    M.extract_jsonpath(ctx)
+  else
+    M.show_jsonpath(ctx)
+  end
 end
 
 function M.open_preview(ctx)

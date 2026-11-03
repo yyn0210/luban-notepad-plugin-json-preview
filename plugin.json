@@ -1,7 +1,7 @@
 {
   "id": "io.github.yyn0210.json-preview",
   "name": "JSON Preview",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "api_version": 1,
   "main": "main.lua",
   "description": "Tree-style JSON preview with node folding, JSONPath extraction, metadata analysis, syntax colors, error locations, duplicate-key hints, JSON Lines support and format/minify/validate commands.",
@@ -41,6 +41,13 @@
         "when": "edit_text"
       },
       {
+        "id": "json.fold.toggle-all",
+        "label": "JSON: Toggle Fold All",
+        "description": "Fold or expand every nested container from the preview toolbar",
+        "entry": "toggle_all_folds",
+        "when": "edit_text"
+      },
+      {
         "id": "json.path.show",
         "label": "JSON: Show JSONPath",
         "description": "Show the JSONPath of the value at the cursor",
@@ -52,6 +59,13 @@
         "label": "JSON: Extract JSONPath",
         "description": "Evaluate the selected JSONPath expression, or the configured one, in the inspector",
         "entry": "extract_jsonpath",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.path.action",
+        "label": "JSON: JSONPath at Cursor or Selection",
+        "description": "Show the path at the cursor, or extract the selected JSONPath expression",
+        "entry": "jsonpath_action",
         "when": "edit_text"
       },
       {
@@ -87,30 +101,6 @@
       {
         "menu": "plugins",
         "command": "json.preview"
-      },
-      {
-        "menu": "plugins",
-        "command": "json.fold.toggle"
-      },
-      {
-        "menu": "plugins",
-        "command": "json.fold.all"
-      },
-      {
-        "menu": "plugins",
-        "command": "json.fold.none"
-      },
-      {
-        "menu": "plugins",
-        "command": "json.path.show"
-      },
-      {
-        "menu": "plugins",
-        "command": "json.path.extract"
-      },
-      {
-        "menu": "plugins",
-        "command": "json.metadata"
       },
       {
         "menu": "plugins",

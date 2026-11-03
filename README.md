@@ -15,6 +15,7 @@ single sandboxed Lua file and requests no permissions.
 - 树状缩进预览，键、字符串、数字、布尔值、`null` 和标点使用当前语法主题配色。
 - 节点折叠：对象/数组带 `▾`/`▸` 标记；可折叠光标所在节点、全部折叠、全部展开，
   也可以设置打开时自动折叠的层级。
+- 预览面板顶部提供三个操作行：折叠全部/展开全部、JSONPath、元数据分析。
 - JSONPath：显示任意值的路径（`$.users[0].name`），支持按选区或设置中的表达式
   提取匹配值，并在 Inspector 面板列出路径与结果。
 - JSON 元数据：值类型统计、最大深度、键数量、重复键、空容器、最大对象/数组、
@@ -50,26 +51,41 @@ single sandboxed Lua file and requests no permissions.
 | --- | --- | --- |
 | `JSON: Preview` | 打开或刷新右侧预览面板 | `Ctrl+Shift+J` |
 | `JSON: Toggle Fold` | 折叠/展开光标所在的对象或数组 | `Ctrl+Alt+J` |
-| `JSON: Fold All` | 折叠根节点以下的所有对象和数组 | — |
-| `JSON: Expand All` | 展开所有已折叠节点 | — |
+| `JSON: Toggle Fold All` | 预览顶部折叠操作行使用：折叠或展开全部 | — |
 | `JSON: Show JSONPath` | 在 Inspector 中显示光标处值的 JSONPath | — |
 | `JSON: Extract JSONPath` | 按选区（无选区时用设置）中的表达式提取匹配值 | — |
+| `JSON: JSONPath at Cursor or Selection` | 预览顶部 JSONPath 操作行使用：有选区则提取，否则显示光标处路径 | — |
 | `JSON: Metadata` | 在 Inspector 中显示 JSON 元数据 | — |
 | `JSON: Format Document` | 按设置中的缩进宽度格式化当前文档 | — |
 | `JSON: Minify Document` | 压缩为单行 JSON | — |
 | `JSON: Validate` | 校验并报告类型、键/元素数量或错误位置 | — |
 
-命令可从命令面板或“插件”菜单执行；快捷键可在快捷键编辑器中修改。
+预览、格式化、压缩和校验命令可从“插件”菜单执行；折叠、JSONPath 和元数据
+通过预览面板顶部的三个操作行使用，也可以从命令面板执行。快捷键可在快捷键
+编辑器中修改。
+
+### 顶部操作行
+
+预览面板的最上方固定显示三行可点击操作：
+
+- **Folding**：当前有折叠节点时显示 `[ Expand All ]`，否则显示 `[ Fold All ]`；
+  点击切换全部折叠状态。同一行提示 `Ctrl+Alt+J` 可折叠光标所在节点。
+- **JSONPath**：有选区时按选区中的表达式提取；没有选区时显示光标处值的路径。
+- **Metadata**：打开 Inspector 显示 JSON 元数据。
+
+宿主在点击面板行时会先关闭面板再执行命令；折叠操作会重新打开预览，JSONPath
+和元数据操作会打开 Inspector。宿主不支持在面板标题栏注入自定义按钮，因此这些
+操作行位于面板内容顶部。
 
 ### 节点折叠
 
 - 预览中的对象和数组用 `▾` 表示展开、`▸` 表示折叠；折叠行会显示隐藏的键或
   元素数量，例如 `"user": ▸ { … 3 keys }`。
 - 宿主的面板行点击会先关闭面板再执行命令，无法在不丢失滚动位置的情况下用鼠标
-  切换单个节点，因此折叠使用编辑器光标定位：把光标放在某个对象/数组内部，
-  执行 `JSON: Toggle Fold`（默认 `Ctrl+Alt+J`）。
-- `JSON: Fold All` 保留根节点展开，折叠根以下的所有容器；
-  `JSON: Expand All` 清空所有折叠状态。
+  切换单个节点，因此单节点折叠使用编辑器光标定位：把光标放在某个对象/数组内部，
+  按 `Ctrl+Alt+J`（或执行 `JSON: Toggle Fold`）。
+- 预览顶部的 **Folding** 操作行在 `[ Fold All ]` 和 `[ Expand All ]` 之间切换；
+  折叠全部保留根节点展开，展开全部清空所有折叠状态。
 - 设置 `fold_level` 可以指定打开文档时的初始折叠层级：`0` 全部展开，
   `1` 只展开根，`2` 再展开根的直接子容器，依此类推。
 - 折叠状态在当前文档的编辑过程中保留；根节点结构变化或切换文档时重置。
@@ -77,8 +93,9 @@ single sandboxed Lua file and requests no permissions.
 
 ### JSONPath
 
-- `JSON: Show JSONPath` 取光标所在的最内层值，在 Inspector 中显示路径、类型和
-  值，同时把路径发到状态栏。
+- 预览顶部的 **JSONPath** 操作行：有选区时按选区中的表达式提取；没有选区时显示
+  光标处值的路径、类型和值。也可以直接执行 `JSON: Show JSONPath` 或
+  `JSON: Extract JSONPath`。
 - `JSON: Extract JSONPath` 优先使用编辑器选区中的文本作为表达式；没有选区时
   使用插件设置 `jsonpath`。结果在 Inspector 中按 `路径 = 值` 列出；JSON Lines
   会标注记录所在行。
@@ -95,10 +112,10 @@ single sandboxed Lua file and requests no permissions.
 
 ### 元数据
 
-`JSON: Metadata` 在 Inspector 中显示：值类型计数、最大深度及其路径、键总数与
-重复键、空容器、最大对象/数组、字符串字符数与最长字符串、数字的整数/小数/
-指数分布及数值范围、顶层键，以及 JSON Lines 的记录数。重复键最多列出 20 处，
-其余显示剩余数量。
+`JSON: Metadata` 或预览顶部的 **Metadata** 操作行在 Inspector 中显示：值类型
+计数、最大深度及其路径、键总数与重复键、空容器、最大对象/数组、字符串字符数与
+最长字符串、数字的整数/小数/指数分布及数值范围、顶层键，以及 JSON Lines 的
+记录数。重复键最多列出 20 处，其余显示剩余数量。
 
 ### Inspector 面板
 
