@@ -334,7 +334,7 @@ local function parse_number(parser)
       parser.pos = parser.pos + 1
     end
   end
-  return { type = "number", raw = text:sub(start, parser.pos - 1) }
+  return { type = "number", raw = text:sub(start, parser.pos - 1), start = start, finish = parser.pos - 1 }
 end
 
 local function parse_literal(parser)
@@ -342,13 +342,13 @@ local function parse_literal(parser)
   local pos = parser.pos
   if text:sub(pos, pos + 3) == "true" then
     parser.pos = pos + 4
-    return { type = "boolean", value = true }
+    return { type = "boolean", value = true, start = pos, finish = pos + 3 }
   elseif text:sub(pos, pos + 4) == "false" then
     parser.pos = pos + 5
-    return { type = "boolean", value = false }
+    return { type = "boolean", value = false, start = pos, finish = pos + 4 }
   elseif text:sub(pos, pos + 3) == "null" then
     parser.pos = pos + 4
-    return { type = "null" }
+    return { type = "null", start = pos, finish = pos + 3 }
   end
   fail(parser, "Invalid literal; expected 'true', 'false' or 'null'", pos)
 end
@@ -371,7 +371,7 @@ local function parse_object(parser)
   if text:byte(parser.pos) == 125 then
     parser.pos = parser.pos + 1
     parser.depth = parser.depth - 1
-    return { type = "object", pairs = pairs, duplicates = 0 }
+    return { type = "object", pairs = pairs, duplicates = 0, start = start, finish = parser.pos - 1 }
   end
   while true do
     skip_ws(parser)
@@ -428,7 +428,7 @@ local function parse_object(parser)
     elseif byte == 125 then
       parser.pos = parser.pos + 1
       parser.depth = parser.depth - 1
-      return { type = "object", pairs = pairs, duplicates = duplicates }
+      return { type = "object", pairs = pairs, duplicates = duplicates, start = start, finish = parser.pos - 1 }
     else
       if byte == 47 then
         fail(parser, "Comments are not allowed in JSON", parser.pos)
@@ -454,7 +454,7 @@ local function parse_array(parser)
   if text:byte(parser.pos) == 93 then
     parser.pos = parser.pos + 1
     parser.depth = parser.depth - 1
-    return { type = "array", items = items }
+    return { type = "array", items = items, start = start, finish = parser.pos - 1 }
   end
   while true do
     items[#items + 1] = parse_value(parser)
@@ -472,7 +472,7 @@ local function parse_array(parser)
     elseif byte == 93 then
       parser.pos = parser.pos + 1
       parser.depth = parser.depth - 1
-      return { type = "array", items = items }
+      return { type = "array", items = items, start = start, finish = parser.pos - 1 }
     else
       if byte == 47 then
         fail(parser, "Comments are not allowed in JSON", parser.pos)
@@ -494,7 +494,8 @@ parse_value = function(parser)
     return parse_array(parser)
   elseif byte == 34 then
     local start = parser.pos
-    return { type = "string", value = parse_string(parser), start = start }
+    local value = parse_string(parser)
+    return { type = "string", value = value, start = start, finish = parser.pos - 1 }
   elseif byte == 116 or byte == 102 or byte == 110 then
     return parse_literal(parser)
   elseif byte == 45 or is_digit(byte) then
@@ -707,6 +708,315 @@ local function ordered_pairs(node, sort_keys)
 end
 
 -- ===========================================================================
+-- JSONPath, document positions and fold state
+-- ===========================================================================
+
+local MAX_FOLD_ENTRIES = 10000
+local MAX_PATH_BYTES = 2048
+
+local fold_state = {
+  doc_key = nil,
+  signature = nil,
+  level = nil,
+  collapsed = {},
+  count = 0,
+  seeded = false,
+}
+
+local function trim(text)
+  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Very deep documents can otherwise build paths quadratic in the source size.
+-- Keep paths bounded; the suffix hash still keeps sibling fold identities apart.
+local function shorten_path(path)
+  if #path <= MAX_PATH_BYTES then
+    return path
+  end
+  local hash = 5381
+  for index = 1, #path do
+    hash = (hash * 33 + path:byte(index)) % 4294967296
+  end
+  return utf8_prefix(path, MAX_PATH_BYTES - 10) .. "#" .. string.format("%08x", hash)
+end
+
+local function is_identifier(key)
+  return key:match("^[A-Za-z_][A-Za-z0-9_]*$") ~= nil
+end
+
+local function append_key_path(path, key)
+  if is_identifier(key) then
+    return shorten_path(path .. "." .. key)
+  end
+  return shorten_path(path .. "[" .. encode_string(key) .. "]")
+end
+
+local function append_index_path(path, index)
+  return shorten_path(path .. "[" .. index .. "]")
+end
+
+-- Paths used for display (JSONPath) and for fold identity. Duplicate object
+-- keys share a display path, so their fold path also carries the pair index.
+local function child_paths(path, fold_path, pair)
+  local display = append_key_path(path, pair.key)
+  local fold = append_key_path(fold_path, pair.key)
+  if pair.duplicate_of then
+    fold = fold .. "#" .. pair.index
+  end
+  return display, fold
+end
+
+local function array_child_paths(path, fold_path, index)
+  return append_index_path(path, index), append_index_path(fold_path, index)
+end
+
+local function walk_containers(node, depth, path, fold_path, visit)
+  if node.type == "object" then
+    visit(node, depth, path, fold_path)
+    for _, pair in ipairs(node.pairs) do
+      local child_path, child_fold = child_paths(path, fold_path, pair)
+      walk_containers(pair.value, depth + 1, child_path, child_fold, visit)
+    end
+  elseif node.type == "array" then
+    visit(node, depth, path, fold_path)
+    for index, item in ipairs(node.items) do
+      local child_path, child_fold = array_child_paths(path, fold_path, index - 1)
+      walk_containers(item, depth + 1, child_path, child_fold, visit)
+    end
+  end
+end
+
+local function clear_collapsed()
+  for path in pairs(fold_state.collapsed) do
+    fold_state.collapsed[path] = nil
+  end
+  fold_state.count = 0
+end
+
+local function add_collapsed(path)
+  if fold_state.count >= MAX_FOLD_ENTRIES then
+    return false
+  end
+  if not fold_state.collapsed[path] then
+    fold_state.collapsed[path] = true
+    fold_state.count = fold_state.count + 1
+  end
+  return true
+end
+
+local function remove_collapsed(path)
+  if fold_state.collapsed[path] then
+    fold_state.collapsed[path] = nil
+    fold_state.count = fold_state.count - 1
+  end
+end
+
+local function document_key(doc)
+  if type(doc.path) == "string" and doc.path ~= "" then
+    return doc.path
+  end
+  return "<untitled>"
+end
+
+-- A cheap structural fingerprint. Editing values keeps the fold state; adding
+-- or removing root keys/items resets it so stale paths do not linger.
+local function roots_signature(roots)
+  local parts = {}
+  for _, root in ipairs(roots) do
+    local node = root.node
+    if node.type == "object" then
+      parts[#parts + 1] = "o" .. #node.pairs
+      for index = 1, math.min(#node.pairs, 24) do
+        parts[#parts + 1] = utf8_prefix(node.pairs[index].key, 40)
+      end
+    elseif node.type == "array" then
+      parts[#parts + 1] = "a" .. #node.items
+    else
+      parts[#parts + 1] = node.type
+    end
+  end
+  local signature = table.concat(parts, "\0")
+  if #signature > 512 then
+    signature = utf8_prefix(signature, 512)
+  end
+  return signature
+end
+
+local function foldable(node)
+  if node.type == "object" then
+    return #node.pairs > 0
+  elseif node.type == "array" then
+    return #node.items > 0
+  end
+  return false
+end
+
+local function seed_fold_level(roots, level)
+  if level <= 0 then
+    return
+  end
+  for _, root in ipairs(roots) do
+    local fold_root = root.fold_prefix or "$"
+    walk_containers(root.node, 1, "$", fold_root, function(node, depth, _, fold_path)
+      if depth > level and foldable(node) then
+        add_collapsed(fold_path)
+      end
+    end)
+  end
+end
+
+local function ensure_fold_state(doc, roots, fold_level)
+  local key = document_key(doc)
+  local signature = roots_signature(roots)
+  if fold_state.doc_key ~= key
+    or fold_state.signature ~= signature
+    or fold_state.level ~= fold_level
+  then
+    fold_state.doc_key = key
+    fold_state.signature = signature
+    fold_state.level = fold_level
+    clear_collapsed()
+    fold_state.seeded = false
+  end
+  if not fold_state.seeded then
+    seed_fold_level(roots, fold_level)
+    fold_state.seeded = true
+  end
+  return fold_state
+end
+
+local function count_visible_folded(node, fold_path, collapsed)
+  if node.type == "object" then
+    if #node.pairs > 0 and collapsed[fold_path] then
+      return 1
+    end
+    local total = 0
+    for _, pair in ipairs(node.pairs) do
+      local _, child_fold = child_paths("", fold_path, pair)
+      total = total + count_visible_folded(pair.value, child_fold, collapsed)
+    end
+    return total
+  elseif node.type == "array" then
+    if #node.items > 0 and collapsed[fold_path] then
+      return 1
+    end
+    local total = 0
+    for index, item in ipairs(node.items) do
+      local _, child_fold = array_child_paths("", fold_path, index - 1)
+      total = total + count_visible_folded(item, child_fold, collapsed)
+    end
+    return total
+  end
+  return 0
+end
+
+local function fold_all(roots)
+  clear_collapsed()
+  for _, root in ipairs(roots) do
+    local fold_root = root.fold_prefix or "$"
+    walk_containers(root.node, 1, "$", fold_root, function(node, depth, _, fold_path)
+      if depth > 1 and foldable(node) then
+        add_collapsed(fold_path)
+      end
+    end)
+  end
+  fold_state.seeded = true
+end
+
+local function expand_all()
+  clear_collapsed()
+  fold_state.seeded = true
+end
+
+-- Find the deepest node containing a byte position. `containers` holds every
+-- object/array on the path so callers can fold the enclosing node even when the
+-- cursor sits on a scalar.
+local function locate_node(root, pos, display_path, fold_path)
+  local found = nil
+  local containers = {}
+  local function visit(node, path, fold)
+    if type(node.start) ~= "number" or type(node.finish) ~= "number" then
+      return false
+    end
+    if pos < node.start or pos > node.finish then
+      return false
+    end
+    if node.type == "object" or node.type == "array" then
+      containers[#containers + 1] = {
+        node = node,
+        path = path,
+        fold_path = fold,
+        depth = #containers + 1,
+      }
+    end
+    found = { node = node, path = path, fold_path = fold, containers = containers }
+    if node.type == "object" then
+      for _, pair in ipairs(node.pairs) do
+        local child_path, child_fold = child_paths(path, fold, pair)
+        if visit(pair.value, child_path, child_fold) then
+          return true
+        end
+      end
+    elseif node.type == "array" then
+      for index, item in ipairs(node.items) do
+        local child_path, child_fold = array_child_paths(path, fold, index - 1)
+        if visit(item, child_path, child_fold) then
+          return true
+        end
+      end
+    end
+    return true
+  end
+  if not visit(root, display_path or "$", fold_path or "$") then
+    return nil
+  end
+  return found
+end
+
+local function char_offset_at(text, line, column)
+  local starts = compute_line_starts(text)
+  line = math.max(1, math.min(line or 1, #starts))
+  local line_start = starts[line]
+  local line_end = (starts[line + 1] or (#text + 1)) - 1
+  local line_text = text:sub(line_start, line_end)
+  local chars = utf8.len(line_text)
+  if chars == nil then
+    chars = #line_text
+  end
+  column = math.max(1, math.min(column or 1, chars + 1))
+  local before = text:sub(1, line_start - 1)
+  local before_chars = utf8.len(before)
+  if before_chars == nil then
+    before_chars = #before
+  end
+  return before_chars + column - 1
+end
+
+local function byte_offset_at(text, char_index)
+  char_index = math.max(0, char_index or 0)
+  local byte = utf8.offset(text, char_index + 1)
+  if not byte then
+    return #text + 1
+  end
+  return byte
+end
+
+local function sub_chars(text, start_char, end_char)
+  local count = utf8.len(text)
+  if count == nil then
+    count = #text
+  end
+  start_char = math.max(0, math.min(start_char or 0, count))
+  end_char = math.max(start_char, math.min(end_char or start_char, count))
+  local from = utf8.offset(text, start_char + 1) or (#text + 1)
+  local to = utf8.offset(text, end_char + 1) or (#text + 1)
+  if to <= from then
+    return ""
+  end
+  return text:sub(from, to - 1)
+end
+
+-- ===========================================================================
 -- Plain serialization (format and minify commands)
 -- ===========================================================================
 
@@ -854,7 +1164,25 @@ end
 
 local render_value
 
-render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line_for_pos)
+local function combine_notes(notes, opts, display_path)
+  local out = {}
+  if notes then
+    for _, note in ipairs(notes) do
+      out[#out + 1] = note
+    end
+  end
+  if opts.show_paths and display_path then
+    out[#out + 1] = display_path
+  end
+  if #out == 0 then
+    return nil
+  end
+  return out
+end
+
+render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line_for_pos, display_path, fold_path)
+  display_path = display_path or "$"
+  fold_path = fold_path or "$"
   local indents = opts.indents
   local tokens = { { text = indents[depth] } }
   for _, token in ipairs(prefix) do
@@ -867,10 +1195,24 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
       if suffix ~= "" then
         tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
       end
-      return push_line(renderer, finish_line(tokens, notes))
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
     end
+    if opts.collapsed and opts.collapsed[fold_path] then
+      tokens[#tokens + 1] = { text = "▸ ", style = "muted" }
+      tokens[#tokens + 1] = { text = "{", role = "punctuation.bracket" }
+      tokens[#tokens + 1] = {
+        text = string.format(" … %d %s ", #pairs, plural(#pairs, "key", "keys")),
+        style = "muted",
+      }
+      tokens[#tokens + 1] = { text = "}", role = "punctuation.bracket" }
+      if suffix ~= "" then
+        tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
+      end
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
+    end
+    tokens[#tokens + 1] = { text = "▾ ", style = "muted" }
     tokens[#tokens + 1] = { text = "{", role = "punctuation.bracket" }
-    if not push_line(renderer, finish_line(tokens, notes)) then
+    if not push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path))) then
       return false
     end
     for index, pair in ipairs(pairs) do
@@ -884,7 +1226,8 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
         { text = ": ", role = "punctuation" },
       }
       local child_suffix = index < #pairs and "," or ""
-      if not render_value(renderer, pair.value, depth + 1, child_prefix, child_suffix, pair_notes, opts, line_for_pos) then
+      local child_display, child_fold = child_paths(display_path, fold_path, pair)
+      if not render_value(renderer, pair.value, depth + 1, child_prefix, child_suffix, pair_notes, opts, line_for_pos, child_display, child_fold) then
         return false
       end
     end
@@ -902,15 +1245,30 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
       if suffix ~= "" then
         tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
       end
-      return push_line(renderer, finish_line(tokens, notes))
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
     end
+    if opts.collapsed and opts.collapsed[fold_path] then
+      tokens[#tokens + 1] = { text = "▸ ", style = "muted" }
+      tokens[#tokens + 1] = { text = "[", role = "punctuation.bracket" }
+      tokens[#tokens + 1] = {
+        text = string.format(" … %d %s ", #node.items, plural(#node.items, "item", "items")),
+        style = "muted",
+      }
+      tokens[#tokens + 1] = { text = "]", role = "punctuation.bracket" }
+      if suffix ~= "" then
+        tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
+      end
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
+    end
+    tokens[#tokens + 1] = { text = "▾ ", style = "muted" }
     tokens[#tokens + 1] = { text = "[", role = "punctuation.bracket" }
-    if not push_line(renderer, finish_line(tokens, notes)) then
+    if not push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path))) then
       return false
     end
     for index, item in ipairs(node.items) do
       local child_suffix = index < #node.items and "," or ""
-      if not render_value(renderer, item, depth + 1, {}, child_suffix, nil, opts, line_for_pos) then
+      local child_display, child_fold = array_child_paths(display_path, fold_path, index - 1)
+      if not render_value(renderer, item, depth + 1, {}, child_suffix, nil, opts, line_for_pos, child_display, child_fold) then
         return false
       end
     end
@@ -923,7 +1281,12 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
     end
     return push_line(renderer, finish_line(close_tokens))
   end
-  local value_notes = notes or {}
+  local value_notes = {}
+  if notes then
+    for _, note in ipairs(notes) do
+      value_notes[#value_notes + 1] = note
+    end
+  end
   if node.type == "string" then
     local text, truncated, total = display_string(node.value, MAX_STRING_DISPLAY)
     tokens[#tokens + 1] = { text = text, role = "string" }
@@ -944,7 +1307,7 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
   if suffix ~= "" then
     tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
   end
-  return push_line(renderer, finish_line(tokens, value_notes))
+  return push_line(renderer, finish_line(tokens, combine_notes(value_notes, opts, display_path)))
 end
 
 local function parse_json_lines(text)
@@ -966,19 +1329,27 @@ local function parse_json_lines(text)
   return records
 end
 
-local function render_valid(text, root, opts)
+local function render_valid(text, root, opts, roots)
   local renderer = { lines = {}, count = 0, overflow = false }
   local duplicates = count_duplicates(root)
   local summary = describe_node(root) .. " · " .. format_bytes(#text)
   if duplicates > 0 then
     summary = summary .. " · " .. duplicates .. " " .. plural(duplicates, "duplicate key", "duplicate keys")
   end
+  local folded = 0
+  for _, root in ipairs(roots or {}) do
+    folded = folded + count_visible_folded(root.node, root.fold_prefix or "$", opts.collapsed or {})
+  end
+  if folded > 0 then
+    summary = summary .. " · " .. folded .. " folded"
+  end
   push_line(renderer, { text = summary, style = "muted" })
   local starts = compute_line_starts(text)
   local function line_for_pos(pos)
     return line_number_at(starts, pos)
   end
-  render_value(renderer, root, 0, {}, "", nil, opts, line_for_pos)
+  local fold_root = (roots and roots[1] and roots[1].fold_prefix) or "$"
+  render_value(renderer, root, 0, {}, "", nil, opts, line_for_pos, "$", fold_root)
   if renderer.overflow then
     renderer.lines[#renderer.lines + 1] = {
       text = string.format("Preview truncated: showing the first %d lines.", MAX_RENDER_LINES),
@@ -988,7 +1359,7 @@ local function render_valid(text, root, opts)
   return renderer.lines
 end
 
-local function render_json_lines(text, records, opts)
+local function render_json_lines(text, records, opts, roots)
   local renderer = { lines = {}, count = 0, overflow = false }
   local duplicates = 0
   for _, record in ipairs(records) do
@@ -1003,6 +1374,13 @@ local function render_json_lines(text, records, opts)
   if duplicates > 0 then
     summary = summary .. " · " .. duplicates .. " " .. plural(duplicates, "duplicate key", "duplicate keys")
   end
+  local folded = 0
+  for _, root in ipairs(roots or {}) do
+    folded = folded + count_visible_folded(root.node, root.fold_prefix or "$", opts.collapsed or {})
+  end
+  if folded > 0 then
+    summary = summary .. " · " .. folded .. " folded"
+  end
   push_line(renderer, { text = summary, style = "muted" })
   for _, record in ipairs(records) do
     local record_summary = string.format(
@@ -1016,7 +1394,8 @@ local function render_json_lines(text, records, opts)
     local function line_for_pos(_)
       return record.source_line
     end
-    if not render_value(renderer, record.root, 0, {}, "", nil, opts, line_for_pos) then
+    local fold_root = "L" .. record.source_line .. "$"
+    if not render_value(renderer, record.root, 0, {}, "", nil, opts, line_for_pos, "$", fold_root) then
       break
     end
   end
@@ -1117,7 +1496,9 @@ local function render_document(doc, opts)
   end
   local ok, root = pcall(parse_json, text)
   if ok then
-    local lines = render_valid(text, root, opts)
+    local roots = { { node = root, fold_prefix = "$" } }
+    ensure_fold_state(doc, roots, opts.fold_level)
+    local lines = render_valid(text, root, opts, roots)
     if truncated then
       lines[#lines + 1] = {
         text = "Preview truncated: the document is larger than 512 KiB.",
@@ -1135,7 +1516,12 @@ local function render_document(doc, opts)
   if opts.json_lines and not truncated then
     local records = parse_json_lines(text)
     if records then
-      return { title = document_title(doc), lines = render_json_lines(text, records, opts) }
+      local roots = {}
+      for index, record in ipairs(records) do
+        roots[index] = { node = record.root, fold_prefix = "L" .. record.source_line .. "$" }
+      end
+      ensure_fold_state(doc, roots, opts.fold_level)
+      return { title = document_title(doc), lines = render_json_lines(text, records, opts, roots) }
     end
   end
   return { title = document_title(doc), lines = render_error(text, root, truncated) }
@@ -1177,12 +1563,23 @@ local function setting_int(key, default, minimum, maximum)
   return default
 end
 
+local function setting_string(key, default)
+  local value = raw_setting(key)
+  if type(value) == "string" then
+    return value
+  end
+  return default
+end
+
 local function preview_options()
   local indent = setting_int("indent", 2, 1, 8)
   return {
     indent = indent,
     sort_keys = setting_bool("sort_keys", false),
     json_lines = setting_bool("json_lines", true),
+    fold_level = setting_int("fold_level", 0, 0, 16),
+    show_paths = setting_bool("show_paths", false),
+    collapsed = fold_state.collapsed,
     indents = indent_cache(indent),
   }
 end
@@ -1243,6 +1640,1093 @@ local function update_document(command, output)
     return false
   end
   return true
+end
+
+-- ===========================================================================
+-- Analysis documents (single JSON value or JSON Lines)
+-- ===========================================================================
+
+local function analysis_document(command)
+  local doc = active_document()
+  if not doc then
+    notify(command .. ": no editable document is active.")
+    return nil
+  end
+  local raw_text = type(doc.text) == "string" and doc.text or ""
+  local text = normalize_text(raw_text)
+  if text:match("^%s*$") then
+    notify(command .. ": the document is empty.")
+    return nil
+  end
+  local truncated = false
+  if #text > MAX_SOURCE_BYTES then
+    text = utf8_prefix(text, MAX_SOURCE_BYTES)
+    truncated = true
+  end
+  local ok, root = pcall(parse_json, text)
+  if ok then
+    return {
+      doc = doc,
+      raw_text = raw_text,
+      text = text,
+      kind = "json",
+      root = root,
+      roots = { { node = root, fold_prefix = "$" } },
+      truncated = truncated,
+    }
+  end
+  if type(root) ~= "table" or not root.json_error then
+    notify(command .. ": " .. tostring(root))
+    return nil
+  end
+  if setting_bool("json_lines", true) and not truncated then
+    local records = parse_json_lines(text)
+    if records then
+      local roots = {}
+      for index, record in ipairs(records) do
+        roots[index] = { node = record.root, fold_prefix = "L" .. record.source_line .. "$" }
+      end
+      return {
+        doc = doc,
+        raw_text = raw_text,
+        text = text,
+        kind = "jsonl",
+        records = records,
+        roots = roots,
+        truncated = false,
+      }
+    end
+  end
+  notify(command .. ": " .. describe_error(text, root))
+  return nil
+end
+
+local function source_label(doc)
+  local path = doc.path
+  if type(path) == "string" and path ~= "" then
+    return path:match("([^/\\]+)$") or path
+  end
+  return "Untitled"
+end
+
+local function doc_line(doc)
+  local line = tonumber(doc.line)
+  if not line or line < 1 then
+    return 1
+  end
+  return math.floor(line)
+end
+
+local function doc_column(doc)
+  local column = tonumber(doc.column)
+  if not column or column < 1 then
+    return 1
+  end
+  return math.floor(column)
+end
+
+local function clip_text(text, limit)
+  if #text <= limit then
+    return text
+  end
+  return utf8_prefix(text, limit) .. "…"
+end
+
+-- ===========================================================================
+-- Metadata
+-- ===========================================================================
+
+local function new_stats()
+  return {
+    values = 0,
+    objects = 0,
+    arrays = 0,
+    strings = 0,
+    numbers = 0,
+    booleans = 0,
+    nulls = 0,
+    keys = 0,
+    duplicates = 0,
+    duplicate_paths = {},
+    empty_objects = 0,
+    empty_arrays = 0,
+    max_depth = 0,
+    deepest_path = "$",
+    deepest_label = nil,
+    string_chars = 0,
+    longest_string = 0,
+    longest_string_path = "$",
+    longest_string_label = nil,
+    integer_numbers = 0,
+    decimal_numbers = 0,
+    exponent_numbers = 0,
+    min_number = nil,
+    min_number_raw = nil,
+    max_number = nil,
+    max_number_raw = nil,
+    true_count = 0,
+    false_count = 0,
+    largest_object = 0,
+    largest_object_path = "$",
+    largest_object_label = nil,
+    largest_array = 0,
+    largest_array_path = "$",
+    largest_array_label = nil,
+    records = 0,
+    top_keys = {},
+  }
+end
+
+local function collect_stats(node, path, depth, stats, line_for_pos, line_label)
+  stats.values = stats.values + 1
+  if depth > stats.max_depth then
+    stats.max_depth = depth
+    stats.deepest_path = path
+    stats.deepest_label = line_label
+  end
+  if node.type == "object" then
+    stats.objects = stats.objects + 1
+    local count = #node.pairs
+    stats.keys = stats.keys + count
+    if count == 0 then
+      stats.empty_objects = stats.empty_objects + 1
+    elseif count > stats.largest_object then
+      stats.largest_object = count
+      stats.largest_object_path = path
+      stats.largest_object_label = line_label
+    end
+    if path == "$" and #stats.top_keys == 0 then
+      for index = 1, math.min(count, 24) do
+        stats.top_keys[index] = node.pairs[index].key
+      end
+    end
+    for _, pair in ipairs(node.pairs) do
+      local child_path = append_key_path(path, pair.key)
+      if pair.duplicate_of then
+        stats.duplicates = stats.duplicates + 1
+        if #stats.duplicate_paths < 20 then
+          stats.duplicate_paths[#stats.duplicate_paths + 1] = {
+            path = child_path,
+            line = line_for_pos and line_for_pos(pair.key_pos) or nil,
+            label = line_label,
+          }
+        end
+      end
+      collect_stats(pair.value, child_path, depth + 1, stats, line_for_pos, line_label)
+    end
+  elseif node.type == "array" then
+    stats.arrays = stats.arrays + 1
+    local count = #node.items
+    if count == 0 then
+      stats.empty_arrays = stats.empty_arrays + 1
+    elseif count > stats.largest_array then
+      stats.largest_array = count
+      stats.largest_array_path = path
+      stats.largest_array_label = line_label
+    end
+    for index, item in ipairs(node.items) do
+      collect_stats(item, append_index_path(path, index - 1), depth + 1, stats, line_for_pos, line_label)
+    end
+  elseif node.type == "string" then
+    stats.strings = stats.strings + 1
+    local chars = char_count(node.value)
+    stats.string_chars = stats.string_chars + chars
+    if chars > stats.longest_string then
+      stats.longest_string = chars
+      stats.longest_string_path = path
+      stats.longest_string_label = line_label
+    end
+  elseif node.type == "number" then
+    stats.numbers = stats.numbers + 1
+    if node.raw:find("[eE]") then
+      stats.exponent_numbers = stats.exponent_numbers + 1
+    elseif node.raw:find("%.") then
+      stats.decimal_numbers = stats.decimal_numbers + 1
+    else
+      stats.integer_numbers = stats.integer_numbers + 1
+    end
+    local value = tonumber(node.raw)
+    if value then
+      if not stats.min_number or value < stats.min_number then
+        stats.min_number = value
+        stats.min_number_raw = node.raw
+      end
+      if not stats.max_number or value > stats.max_number then
+        stats.max_number = value
+        stats.max_number_raw = node.raw
+      end
+    end
+  elseif node.type == "boolean" then
+    stats.booleans = stats.booleans + 1
+    if node.value then
+      stats.true_count = stats.true_count + 1
+    else
+      stats.false_count = stats.false_count + 1
+    end
+  else
+    stats.nulls = stats.nulls + 1
+  end
+end
+
+local function metadata_line(lines, text, style)
+  lines[#lines + 1] = { text = clip_text(text, MAX_LINE_BYTES - 1), style = style or "text" }
+end
+
+local function stat_line(lines, label, value)
+  metadata_line(lines, string.format("  %-14s %s", label, value), "code")
+end
+
+local function label_path(path, label, limit)
+  local text = clip_text(path, limit)
+  if label then
+    return label .. " · " .. text
+  end
+  return text
+end
+
+local function render_metadata(analysis)
+  local stats = new_stats()
+  local starts = compute_line_starts(analysis.text)
+  if analysis.kind == "json" then
+    collect_stats(analysis.root, "$", 1, stats, function(pos)
+      return line_number_at(starts, pos)
+    end, nil)
+  else
+    stats.records = #analysis.records
+    for _, record in ipairs(analysis.records) do
+      collect_stats(record.root, "$", 1, stats, function(_)
+        return record.source_line
+      end, "Line " .. record.source_line)
+    end
+  end
+  local chars = utf8.len(analysis.text)
+  if chars == nil then
+    chars = #analysis.text
+  end
+  local lines = {}
+  local summary = string.format(
+    "%s · %s · %d lines · %d chars",
+    source_label(analysis.doc),
+    format_bytes(#analysis.text),
+    #starts,
+    chars
+  )
+  if analysis.kind == "jsonl" then
+    summary = summary .. string.format(" · %d records", stats.records)
+  end
+  metadata_line(lines, summary, "muted")
+
+  metadata_line(lines, "Values", "h3")
+  stat_line(lines, "Total", stats.values)
+  stat_line(lines, "Objects", stats.objects)
+  stat_line(lines, "Arrays", stats.arrays)
+  stat_line(lines, "Strings", stats.strings)
+  stat_line(lines, "Numbers", stats.numbers)
+  stat_line(lines, "Booleans", stats.booleans .. string.format(" (true %d, false %d)", stats.true_count, stats.false_count))
+  stat_line(lines, "Nulls", stats.nulls)
+
+  metadata_line(lines, "Structure", "h3")
+  stat_line(lines, "Max depth", string.format("%d  (%s)", stats.max_depth, label_path(stats.deepest_path, stats.deepest_label, 160)))
+  local key_text = tostring(stats.keys)
+  if stats.duplicates > 0 then
+    key_text = key_text .. string.format(" · %d duplicate", stats.duplicates)
+  end
+  stat_line(lines, "Keys", key_text)
+  if stats.empty_objects > 0 or stats.empty_arrays > 0 then
+    stat_line(lines, "Empty", string.format(
+      "%d %s · %d %s",
+      stats.empty_objects,
+      plural(stats.empty_objects, "object", "objects"),
+      stats.empty_arrays,
+      plural(stats.empty_arrays, "array", "arrays")
+    ))
+  end
+  if stats.largest_object > 0 then
+    stat_line(lines, "Largest object", string.format(
+      "%d %s (%s)",
+      stats.largest_object,
+      plural(stats.largest_object, "key", "keys"),
+      label_path(stats.largest_object_path, stats.largest_object_label, 140)
+    ))
+  end
+  if stats.largest_array > 0 then
+    stat_line(lines, "Largest array", string.format(
+      "%d %s (%s)",
+      stats.largest_array,
+      plural(stats.largest_array, "item", "items"),
+      label_path(stats.largest_array_path, stats.largest_array_label, 140)
+    ))
+  end
+
+  if stats.strings > 0 then
+    metadata_line(lines, "Strings", "h3")
+    stat_line(lines, "Characters", stats.string_chars)
+    stat_line(lines, "Longest", string.format("%d chars (%s)", stats.longest_string, label_path(stats.longest_string_path, stats.longest_string_label, 140)))
+  end
+
+  if stats.numbers > 0 then
+    metadata_line(lines, "Numbers", "h3")
+    stat_line(lines, "Integers", stats.integer_numbers)
+    stat_line(lines, "Decimals", stats.decimal_numbers)
+    stat_line(lines, "Exponents", stats.exponent_numbers)
+    if stats.min_number_raw then
+      local range = clip_text(stats.min_number_raw, 40)
+      if stats.max_number_raw ~= stats.min_number_raw then
+        range = range .. " … " .. clip_text(stats.max_number_raw, 40)
+      end
+      stat_line(lines, "Range", range)
+    end
+  end
+
+  if #stats.duplicate_paths > 0 then
+    metadata_line(lines, "Duplicate keys", "h3")
+    for _, duplicate in ipairs(stats.duplicate_paths) do
+      local suffix = ""
+      if duplicate.label then
+        suffix = duplicate.label .. " · "
+      elseif duplicate.line then
+        suffix = string.format("line %d · ", duplicate.line)
+      end
+      metadata_line(lines, "  " .. suffix .. clip_text(duplicate.path, 180), "code")
+    end
+    if stats.duplicates > #stats.duplicate_paths then
+      metadata_line(lines, string.format("  … %d more", stats.duplicates - #stats.duplicate_paths), "muted")
+    end
+  end
+
+  if #stats.top_keys > 0 then
+    metadata_line(lines, analysis.kind == "jsonl" and "First record keys" or "Top-level keys", "h3")
+    local shown = {}
+    for index, key in ipairs(stats.top_keys) do
+      shown[index] = clip_text(encode_string(key), 60)
+    end
+    metadata_line(lines, "  " .. table.concat(shown, ", "), "code")
+  end
+
+  if analysis.truncated then
+    metadata_line(lines, "The document is larger than 512 KiB; only the first 512 KiB were analyzed.", "muted")
+  end
+  return { title = "JSON Metadata", lines = lines }
+end
+
+-- ===========================================================================
+-- JSONPath
+-- ===========================================================================
+
+local MAX_JSONPATH_MATCHES = 4000
+local MAX_JSONPATH_DISPLAY = 200
+
+local function jp_fail(state, message, pos)
+  error({ jsonpath_error = true, message = message, pos = pos or state.pos }, 0)
+end
+
+local function jp_skip_ws(state)
+  while state.pos <= state.n do
+    local byte = state.text:byte(state.pos)
+    if byte == 32 or byte == 9 or byte == 10 or byte == 13 then
+      state.pos = state.pos + 1
+    else
+      break
+    end
+  end
+end
+
+local function jp_parse_quoted(state)
+  local quote = state.text:sub(state.pos, state.pos)
+  state.pos = state.pos + 1
+  local out = {}
+  local escapes = {
+    n = "\n", t = "\t", r = "\r", b = "\b", f = "\f",
+    ["\\"] = "\\", ["'"] = "'", ['"'] = '"',
+  }
+  while state.pos <= state.n do
+    local ch = state.text:sub(state.pos, state.pos)
+    if ch == quote then
+      state.pos = state.pos + 1
+      return table.concat(out)
+    elseif ch == "\\" then
+      state.pos = state.pos + 1
+      if state.pos > state.n then
+        jp_fail(state, "Unterminated escape sequence", state.pos - 1)
+      end
+      local escape = state.text:sub(state.pos, state.pos)
+      if escapes[escape] then
+        out[#out + 1] = escapes[escape]
+        state.pos = state.pos + 1
+      elseif escape == "u" then
+        local hex = state.text:sub(state.pos + 1, state.pos + 4)
+        if #hex < 4 or not hex:match("^%x%x%x%x$") then
+          jp_fail(state, "Invalid \\u escape", state.pos + 1)
+        end
+        out[#out + 1] = utf8.char(tonumber(hex, 16))
+        state.pos = state.pos + 5
+      else
+        jp_fail(state, "Invalid escape sequence '\\" .. escape .. "'", state.pos - 1)
+      end
+    else
+      out[#out + 1] = ch
+      state.pos = state.pos + 1
+    end
+  end
+  jp_fail(state, "Unterminated quoted key", state.pos)
+end
+
+local function jp_parse_integer(state)
+  local start = state.pos
+  if state.text:sub(state.pos, state.pos) == "-" then
+    state.pos = state.pos + 1
+  end
+  local digits = state.pos
+  while state.pos <= state.n do
+    local byte = state.text:byte(state.pos)
+    if byte >= 48 and byte <= 57 then
+      state.pos = state.pos + 1
+    else
+      break
+    end
+  end
+  if state.pos == digits then
+    state.pos = start
+    return nil
+  end
+  return tonumber(state.text:sub(start, state.pos - 1))
+end
+
+local function jp_parse_bracket(state)
+  jp_skip_ws(state)
+  state.pos = state.pos + 1
+  local selectors = {}
+  while true do
+    jp_skip_ws(state)
+    local ch = state.text:sub(state.pos, state.pos)
+    if ch == "*" then
+      state.pos = state.pos + 1
+      selectors[#selectors + 1] = { kind = "wildcard" }
+    elseif ch == "'" or ch == '"' then
+      selectors[#selectors + 1] = { kind = "name", name = jp_parse_quoted(state) }
+    elseif ch == ":" or ch == "-" or (ch >= "0" and ch <= "9") then
+      local first = jp_parse_integer(state)
+      jp_skip_ws(state)
+      if state.text:sub(state.pos, state.pos) == ":" then
+        state.pos = state.pos + 1
+        jp_skip_ws(state)
+        local second = jp_parse_integer(state)
+        jp_skip_ws(state)
+        local third = nil
+        if state.text:sub(state.pos, state.pos) == ":" then
+          state.pos = state.pos + 1
+          jp_skip_ws(state)
+          third = jp_parse_integer(state)
+          if third == 0 then
+            jp_fail(state, "A slice step cannot be zero", state.pos - 1)
+          end
+        end
+        selectors[#selectors + 1] = { kind = "slice", first = first, second = second, step = third }
+      elseif first == nil then
+        jp_fail(state, "Expected an array index or a slice", state.pos)
+      else
+        selectors[#selectors + 1] = { kind = "index", index = first }
+      end
+    else
+      jp_fail(state, "Expected a quoted key, an index, a slice or '*'", state.pos)
+    end
+    jp_skip_ws(state)
+    local separator = state.text:sub(state.pos, state.pos)
+    if separator == "," then
+      state.pos = state.pos + 1
+    elseif separator == "]" then
+      state.pos = state.pos + 1
+      return selectors
+    else
+      jp_fail(state, "Expected ',' or ']'", state.pos)
+    end
+  end
+end
+
+local function jp_parse_dot_name(state)
+  local start = state.pos
+  while state.pos <= state.n do
+    local ch = state.text:sub(state.pos, state.pos)
+    if ch == "." or ch == "[" or ch == "]" or ch:match("%s") then
+      break
+    end
+    state.pos = state.pos + 1
+  end
+  if state.pos == start then
+    jp_fail(state, "Expected a property name after '.'", state.pos)
+  end
+  return state.text:sub(start, state.pos - 1)
+end
+
+local function parse_jsonpath(expression)
+  expression = expression or ""
+  local state = { text = expression, pos = 1, n = #expression }
+  jp_skip_ws(state)
+  if state.text:sub(state.pos, state.pos) ~= "$" then
+    jp_fail(state, "JSONPath must start with '$'", state.pos)
+  end
+  state.pos = state.pos + 1
+  local segments = {}
+  while true do
+    jp_skip_ws(state)
+    if state.pos > state.n then
+      break
+    end
+    local ch = state.text:sub(state.pos, state.pos)
+    if ch == "[" then
+      segments[#segments + 1] = { kind = "child", selectors = jp_parse_bracket(state) }
+    elseif ch == "." then
+      if state.text:sub(state.pos, state.pos + 1) == ".." then
+        state.pos = state.pos + 2
+        jp_skip_ws(state)
+        local next_ch = state.text:sub(state.pos, state.pos)
+        local selectors
+        if next_ch == "[" then
+          selectors = jp_parse_bracket(state)
+        elseif next_ch == "*" then
+          state.pos = state.pos + 1
+          selectors = { { kind = "wildcard" } }
+        else
+          selectors = { { kind = "name", name = jp_parse_dot_name(state) } }
+        end
+        segments[#segments + 1] = { kind = "recursive", selectors = selectors }
+      else
+        state.pos = state.pos + 1
+        if state.text:sub(state.pos, state.pos) == "*" then
+          state.pos = state.pos + 1
+          segments[#segments + 1] = { kind = "child", selectors = { { kind = "wildcard" } } }
+        else
+          segments[#segments + 1] = { kind = "child", selectors = { { kind = "name", name = jp_parse_dot_name(state) } } }
+        end
+      end
+    else
+      jp_fail(state, "Unexpected character '" .. ch .. "'", state.pos)
+    end
+  end
+  return segments
+end
+
+local function add_match(out, seen, node, path, duplicate, limit)
+  if #out >= limit then
+    return false
+  end
+  if seen[node] then
+    return true
+  end
+  seen[node] = true
+  out[#out + 1] = { node = node, path = path, duplicate = duplicate }
+  return true
+end
+
+local function apply_selector(node, selector, path, out, seen, limit)
+  if node.type == "object" then
+    if selector.kind == "name" then
+      for _, pair in ipairs(node.pairs) do
+        if pair.key == selector.name then
+          local duplicate = pair.duplicate_of and pair.index or nil
+          if not add_match(out, seen, pair.value, append_key_path(path, pair.key), duplicate, limit) then
+            return false
+          end
+        end
+      end
+    elseif selector.kind == "wildcard" then
+      for _, pair in ipairs(node.pairs) do
+        local duplicate = pair.duplicate_of and pair.index or nil
+        if not add_match(out, seen, pair.value, append_key_path(path, pair.key), duplicate, limit) then
+          return false
+        end
+      end
+    end
+    return true
+  end
+  if node.type == "array" then
+    local count = #node.items
+    if selector.kind == "index" then
+      local index = selector.index
+      if index < 0 then
+        index = count + index
+      end
+      if index >= 0 and index < count then
+        return add_match(out, seen, node.items[index + 1], append_index_path(path, index), nil, limit)
+      end
+    elseif selector.kind == "wildcard" then
+      for index, item in ipairs(node.items) do
+        if not add_match(out, seen, item, append_index_path(path, index - 1), nil, limit) then
+          return false
+        end
+      end
+    elseif selector.kind == "slice" then
+      local step = selector.step or 1
+      local first = selector.first
+      local second = selector.second
+      local start
+      local stop
+      if step > 0 then
+        start = first or 0
+        stop = second or count
+        if start < 0 then start = count + start end
+        if stop < 0 then stop = count + stop end
+        start = math.max(0, start)
+        stop = math.min(count, stop)
+        for index = start, stop - 1, step do
+          if not add_match(out, seen, node.items[index + 1], append_index_path(path, index), nil, limit) then
+            return false
+          end
+        end
+      else
+        start = first
+        stop = second
+        if start == nil then start = count - 1 elseif start < 0 then start = count + start end
+        if stop == nil then stop = -1 elseif stop < 0 then stop = count + stop end
+        start = math.min(count - 1, start)
+        stop = math.max(-1, stop)
+        for index = start, stop + 1, step do
+          if index >= 0 and index < count then
+            if not add_match(out, seen, node.items[index + 1], append_index_path(path, index), nil, limit) then
+              return false
+            end
+          end
+        end
+      end
+    end
+  end
+  return true
+end
+
+local function recursive_apply(node, path, selectors, out, seen, limit)
+  for _, selector in ipairs(selectors) do
+    if not apply_selector(node, selector, path, out, seen, limit) then
+      return false
+    end
+  end
+  if node.type == "object" then
+    for _, pair in ipairs(node.pairs) do
+      local child_path = append_key_path(path, pair.key)
+      if not recursive_apply(pair.value, child_path, selectors, out, seen, limit) then
+        return false
+      end
+    end
+  elseif node.type == "array" then
+    for index, item in ipairs(node.items) do
+      if not recursive_apply(item, append_index_path(path, index - 1), selectors, out, seen, limit) then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+local function evaluate_jsonpath(root, segments, limit)
+  limit = limit or MAX_JSONPATH_MATCHES
+  local matches = { { node = root, path = "$", duplicate = nil } }
+  for _, segment in ipairs(segments) do
+    local next_matches = {}
+    local seen = {}
+    local truncated = false
+    for _, match in ipairs(matches) do
+      local keep_going
+      if segment.kind == "child" then
+        keep_going = true
+        for _, selector in ipairs(segment.selectors) do
+          if not apply_selector(match.node, selector, match.path, next_matches, seen, limit) then
+            keep_going = false
+            truncated = true
+            break
+          end
+        end
+      else
+        keep_going = recursive_apply(match.node, match.path, segment.selectors, next_matches, seen, limit)
+        if not keep_going then
+          truncated = true
+        end
+      end
+      if not keep_going then
+        break
+      end
+    end
+    matches = next_matches
+    if truncated then
+      return matches, true
+    end
+    if #matches == 0 then
+      break
+    end
+  end
+  return matches, false
+end
+
+local function value_preview(node, budget)
+  if node.type == "string" then
+    local text, truncated, total = display_string(node.value, budget)
+    if truncated then
+      text = text .. string.format(" (%d chars)", total)
+    end
+    return text
+  elseif node.type == "number" then
+    local raw, truncated = display_number(node.raw)
+    if truncated then
+      raw = raw .. " (truncated)"
+    end
+    return raw
+  elseif node.type == "boolean" then
+    return node.value and "true" or "false"
+  elseif node.type == "null" then
+    return "null"
+  end
+  local buffer = {}
+  serialize(node, { indent = 0, sort_keys = false, pretty = false }, 0, buffer)
+  local text = table.concat(buffer)
+  return describe_node(node) .. " · " .. clip_text(text, budget)
+end
+
+local function render_jsonpath_error(expression, err)
+  local lines = { { text = "Invalid JSONPath", style = "h2" } }
+  local message = type(err) == "table" and err.message or tostring(err)
+  local pos = type(err) == "table" and err.pos or 1
+  metadata_line(lines, message, "text")
+  metadata_line(lines, "Expression: " .. clip_text(expression, 300), "muted")
+  local shown = clip_text(expression, 300)
+  local caret = math.max(0, math.min(pos - 1, #shown))
+  metadata_line(lines, string.rep(" ", caret) .. "^", "code")
+  return { title = "JSONPath", lines = lines }
+end
+
+local function render_jsonpath_results(analysis, expression)
+  local ok, segments = pcall(parse_jsonpath, expression)
+  if not ok then
+    return render_jsonpath_error(expression, segments)
+  end
+  local results = {}
+  local truncated = false
+  local display_capped = false
+  local total = 0
+  if analysis.kind == "json" then
+    local matches, cut = evaluate_jsonpath(analysis.root, segments)
+    truncated = cut
+    for _, match in ipairs(matches) do
+      results[#results + 1] = match
+    end
+    total = #matches
+  else
+    for _, record in ipairs(analysis.records) do
+      local matches, cut = evaluate_jsonpath(record.root, segments)
+      truncated = truncated or cut
+      for _, match in ipairs(matches) do
+        results[#results + 1] = {
+          node = match.node,
+          path = match.path,
+          duplicate = match.duplicate,
+          line = record.source_line,
+        }
+      end
+      total = total + #matches
+      if #results >= MAX_JSONPATH_DISPLAY then
+        display_capped = true
+        break
+      end
+    end
+  end
+  local lines = { { text = "JSONPath Results", style = "h2" } }
+  metadata_line(lines, "Expression  " .. clip_text(expression, 300), "code")
+  local match_text = tostring(total)
+  if truncated then
+    match_text = match_text .. " (capped)"
+  elseif display_capped then
+    match_text = match_text .. "+ (first " .. MAX_JSONPATH_DISPLAY .. " shown)"
+  end
+  metadata_line(lines, "Matches     " .. match_text, "muted")
+  if total == 0 then
+    metadata_line(lines, "No values match this expression.", "muted")
+    return { title = "JSONPath", lines = lines }
+  end
+  local shown = math.min(#results, MAX_JSONPATH_DISPLAY)
+  for index = 1, shown do
+    local match = results[index]
+    local prefix = match.line and string.format("Line %d · ", match.line) or ""
+    local path = prefix .. match.path
+    if match.duplicate then
+      path = path .. string.format(" (duplicate #%d)", match.duplicate)
+    end
+    metadata_line(
+      lines,
+      string.format("%d  %s = %s", index, clip_text(path, 220), value_preview(match.node, 160)),
+      "code"
+    )
+  end
+  if total > shown then
+    metadata_line(lines, string.format("Showing the first %d of %d matches.", shown, total), "muted")
+  end
+  if truncated then
+    metadata_line(lines, string.format("Evaluation stopped after %d matches.", MAX_JSONPATH_MATCHES), "muted")
+  end
+  return { title = "JSONPath", lines = lines }
+end
+
+local function find_jsonpath_match(root, path)
+  local ok, segments = pcall(parse_jsonpath, path)
+  if not ok then
+    return nil, segments
+  end
+  local matches = evaluate_jsonpath(root, segments, 1)
+  return matches[1], nil
+end
+
+local function render_path_at(analysis, path, line, type_text, value_text)
+  local lines = {}
+  local root = analysis.root
+  if analysis.kind == "jsonl" then
+    for _, record in ipairs(analysis.records) do
+      if record.source_line == line then
+        root = record.root
+        break
+      end
+    end
+    if not root then
+      metadata_line(lines, "The cursor is not on a JSON Lines record.", "muted")
+      return { title = "JSONPath at Cursor", lines = lines }
+    end
+  end
+  local prefix = (analysis.kind == "jsonl" and line) and string.format("Line %d · ", line) or ""
+  metadata_line(lines, "Path   " .. prefix .. clip_text(path, 300), "code")
+  if not type_text then
+    local match, err = find_jsonpath_match(root, path)
+    if not match then
+      local message = type(err) == "table" and err.message or "The path no longer resolves."
+      metadata_line(lines, message, "muted")
+      return { title = "JSONPath at Cursor", lines = lines }
+    end
+    type_text = describe_node(match.node)
+    value_text = value_preview(match.node, 240)
+  end
+  metadata_line(lines, "Type   " .. type_text, "muted")
+  metadata_line(lines, "Value  " .. value_text, "code")
+  return { title = "JSONPath at Cursor", lines = lines }
+end
+
+-- ===========================================================================
+-- Inspector
+-- ===========================================================================
+
+local inspector_state = {
+  mode = "metadata",
+  expression = "",
+  path = "$",
+  line = nil,
+  type_text = nil,
+  value_text = nil,
+}
+
+local function open_inspector()
+  if type(luban) == "table" and type(luban.panel) == "table" and type(luban.panel.open) == "function" then
+    local ok, err = luban.panel.open("json.inspector.panel")
+    if not ok then
+      notify(err or "cannot open the JSON inspector")
+    end
+  else
+    notify("JSON Inspector: open the panel from the Plugins menu")
+  end
+end
+
+function M.render_inspector(ctx)
+  if type(luban) ~= "table" then
+    return {
+      title = "JSON Inspector",
+      lines = { { text = "Plugin host is unavailable.", style = "muted" } },
+    }
+  end
+  local function build()
+    local analysis = analysis_document("JSON Inspector")
+    if not analysis then
+      local doc = active_document()
+      if doc then
+        local text = normalize_text(type(doc.text) == "string" and doc.text or "")
+        local truncated = false
+        if #text > MAX_SOURCE_BYTES then
+          text = utf8_prefix(text, MAX_SOURCE_BYTES)
+          truncated = true
+        end
+        local ok, root = pcall(parse_json, text)
+        if not ok and type(root) == "table" and root.json_error then
+          return { title = "JSON Inspector", lines = render_error(text, root, truncated) }
+        end
+      end
+      return {
+        title = "JSON Inspector",
+        lines = { { text = "The document cannot be analyzed; see the status message.", style = "muted" } },
+      }
+    end
+    if inspector_state.mode == "jsonpath" then
+      return render_jsonpath_results(analysis, inspector_state.expression)
+    elseif inspector_state.mode == "path" then
+      return render_path_at(
+        analysis,
+        inspector_state.path,
+        inspector_state.line,
+        inspector_state.type_text,
+        inspector_state.value_text
+      )
+    end
+    return render_metadata(analysis)
+  end
+  local ok, result = pcall(build)
+  if not ok then
+    if type(luban.log) == "function" then
+      luban.log("error", "json inspector failed: " .. tostring(result))
+    end
+    return {
+      title = "JSON Inspector",
+      lines = { { text = "Inspector failed: " .. tostring(result), style = "muted" } },
+    }
+  end
+  return result
+end
+
+function M.show_metadata(ctx)
+  local analysis = analysis_document("JSON: cannot read metadata")
+  if not analysis then
+    return
+  end
+  inspector_state.mode = "metadata"
+  open_inspector()
+  notify("JSON metadata opened in the inspector.")
+end
+
+function M.show_jsonpath(ctx)
+  local analysis = analysis_document("JSON: cannot read JSONPath")
+  if not analysis then
+    return
+  end
+  local starts = compute_line_starts(analysis.text)
+  local line = doc_line(analysis.doc)
+  local char_index = char_offset_at(analysis.text, line, doc_column(analysis.doc))
+  local byte = byte_offset_at(analysis.text, char_index)
+  local found = nil
+  local record_line = nil
+  if analysis.kind == "json" then
+    found = locate_node(analysis.root, byte, "$", "$")
+  else
+    for _, record in ipairs(analysis.records) do
+      if record.source_line == line then
+        local line_start = starts[line]
+        local relative = byte - line_start + 1
+        found = locate_node(record.root, relative, "$", "L" .. line .. "$")
+        record_line = line
+        break
+      end
+    end
+  end
+  if not found then
+    notify("JSONPath: the cursor is not inside a JSON value.")
+    return
+  end
+  inspector_state.mode = "path"
+  inspector_state.path = found.path
+  inspector_state.line = record_line
+  inspector_state.type_text = describe_node(found.node)
+  inspector_state.value_text = value_preview(found.node, 240)
+  open_inspector()
+  notify("JSONPath: " .. clip_text(found.path, 120))
+end
+
+function M.extract_jsonpath(ctx)
+  local analysis = analysis_document("JSON: cannot extract JSONPath")
+  if not analysis then
+    return
+  end
+  local expression = ""
+  local doc = analysis.doc
+  if type(doc.selection_start) == "number"
+    and type(doc.selection_end) == "number"
+    and doc.selection_end > doc.selection_start
+  then
+    expression = trim(sub_chars(analysis.raw_text, doc.selection_start, doc.selection_end))
+  end
+  if expression == "" then
+    expression = trim(setting_string("jsonpath", ""))
+  end
+  if expression == "" then
+    notify("JSON: select a JSONPath expression or set the 'jsonpath' plugin setting.")
+    return
+  end
+  local ok, err = pcall(parse_jsonpath, expression)
+  if not ok then
+    local message = type(err) == "table" and err.message or tostring(err)
+    local pos = type(err) == "table" and err.pos or 1
+    notify(string.format("JSON: invalid JSONPath: %s (column %d)", message, pos))
+    return
+  end
+  inspector_state.mode = "jsonpath"
+  inspector_state.expression = expression
+  open_inspector()
+  notify("JSONPath: " .. clip_text(expression, 100))
+end
+
+function M.toggle_fold(ctx)
+  local analysis = analysis_document("JSON: cannot fold")
+  if not analysis then
+    return
+  end
+  local starts = compute_line_starts(analysis.text)
+  local line = doc_line(analysis.doc)
+  local char_index = char_offset_at(analysis.text, line, doc_column(analysis.doc))
+  local byte = byte_offset_at(analysis.text, char_index)
+  local found = nil
+  local record_line = nil
+  if analysis.kind == "json" then
+    found = locate_node(analysis.root, byte, "$", "$")
+  else
+    for _, record in ipairs(analysis.records) do
+      if record.source_line == line then
+        found = locate_node(record.root, byte - starts[line] + 1, "$", "L" .. line .. "$")
+        record_line = line
+        break
+      end
+    end
+  end
+  if not found then
+    notify("JSON: the cursor is not inside a JSON value.")
+    return
+  end
+  local container = found.containers[#found.containers]
+  if not container then
+    notify("JSON: the value at the cursor is not an object or an array.")
+    return
+  end
+  ensure_fold_state(analysis.doc, analysis.roots, preview_options().fold_level)
+  local path = container.fold_path
+  if fold_state.collapsed[path] then
+    remove_collapsed(path)
+    notify("JSON: expanded " .. clip_text(container.path, 120))
+  else
+    if not add_collapsed(path) then
+      notify("JSON: too many folded nodes.")
+      return
+    end
+    notify("JSON: folded " .. clip_text(container.path, 120))
+  end
+  M.open_preview(ctx)
+end
+
+function M.fold_all(ctx)
+  local analysis = analysis_document("JSON: cannot fold")
+  if not analysis then
+    return
+  end
+  ensure_fold_state(analysis.doc, analysis.roots, preview_options().fold_level)
+  fold_all(analysis.roots)
+  M.open_preview(ctx)
+  notify(string.format("JSON: folded %d nodes.", fold_state.count))
+end
+
+function M.expand_all(ctx)
+  local analysis = analysis_document("JSON: cannot expand")
+  if not analysis then
+    return
+  end
+  ensure_fold_state(analysis.doc, analysis.roots, preview_options().fold_level)
+  expand_all()
+  M.open_preview(ctx)
+  notify("JSON: expanded all nodes.")
 end
 
 function M.open_preview(ctx)
@@ -1357,6 +2841,22 @@ M._internals = {
   encode_string = encode_string,
   format_bytes = format_bytes,
   count_duplicates = count_duplicates,
+  append_key_path = append_key_path,
+  locate_node = locate_node,
+  char_offset_at = char_offset_at,
+  byte_offset_at = byte_offset_at,
+  sub_chars = sub_chars,
+  ensure_fold_state = ensure_fold_state,
+  fold_state = fold_state,
+  parse_jsonpath = parse_jsonpath,
+  evaluate_jsonpath = evaluate_jsonpath,
+  new_stats = new_stats,
+  collect_stats = collect_stats,
+  render_metadata = render_metadata,
+  render_jsonpath_results = render_jsonpath_results,
+  render_path_at = render_path_at,
+  analysis_document = analysis_document,
+  inspector_state = inspector_state,
 }
 
 return M

@@ -1,10 +1,10 @@
 {
   "id": "io.github.yyn0210.json-preview",
   "name": "JSON Preview",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "api_version": 1,
   "main": "main.lua",
-  "description": "Tree-style JSON preview in a side panel with syntax colors, error locations, duplicate-key hints, JSON Lines support and format/minify commands.",
+  "description": "Tree-style JSON preview with node folding, JSONPath extraction, metadata analysis, syntax colors, error locations, duplicate-key hints, JSON Lines support and format/minify/validate commands.",
   "author": "yyn0210",
   "permissions": [],
   "activate": "activate",
@@ -16,6 +16,49 @@
         "description": "Open or refresh the JSON preview",
         "entry": "open_preview",
         "default_keybinding": "ctrl+shift+j",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.fold.toggle",
+        "label": "JSON: Toggle Fold",
+        "description": "Fold or expand the object or array containing the cursor",
+        "entry": "toggle_fold",
+        "default_keybinding": "ctrl+alt+j",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.fold.all",
+        "label": "JSON: Fold All",
+        "description": "Collapse every nested object and array in the preview",
+        "entry": "fold_all",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.fold.none",
+        "label": "JSON: Expand All",
+        "description": "Expand every folded object and array in the preview",
+        "entry": "expand_all",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.path.show",
+        "label": "JSON: Show JSONPath",
+        "description": "Show the JSONPath of the value at the cursor",
+        "entry": "show_jsonpath",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.path.extract",
+        "label": "JSON: Extract JSONPath",
+        "description": "Evaluate the selected JSONPath expression, or the configured one, in the inspector",
+        "entry": "extract_jsonpath",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.metadata",
+        "label": "JSON: Metadata",
+        "description": "Analyze value counts, depth, duplicate keys, strings and numbers",
+        "entry": "show_metadata",
         "when": "edit_text"
       },
       {
@@ -47,6 +90,30 @@
       },
       {
         "menu": "plugins",
+        "command": "json.fold.toggle"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.fold.all"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.fold.none"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.path.show"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.path.extract"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.metadata"
+      },
+      {
+        "menu": "plugins",
         "command": "json.format"
       },
       {
@@ -66,6 +133,14 @@
         "placement": "right",
         "width": 720,
         "refresh": "edit"
+      },
+      {
+        "id": "json.inspector.panel",
+        "title": "JSON Inspector",
+        "entry": "render_inspector",
+        "placement": "right",
+        "width": 640,
+        "refresh": "manual"
       }
     ],
     "settings": [
@@ -92,6 +167,31 @@
         "label": "Preview JSON Lines",
         "description": "When the document is not a single JSON value, preview each non-empty line as one record if every line is valid JSON.",
         "default": true
+      },
+      {
+        "key": "fold_level",
+        "type": "number",
+        "label": "Initial fold level",
+        "description": "0 expands everything. 1 keeps only the root expanded, 2 also keeps its direct containers expanded, and so on.",
+        "default": 0,
+        "min": 0,
+        "max": 16,
+        "step": 1
+      },
+      {
+        "key": "show_paths",
+        "type": "boolean",
+        "label": "Show JSONPath on preview lines",
+        "description": "Append the JSONPath of each value to its preview line.",
+        "default": false
+      },
+      {
+        "key": "jsonpath",
+        "type": "string",
+        "label": "JSONPath expression",
+        "description": "Used by JSON: Extract JSONPath when no text is selected.",
+        "default": "",
+        "max_length": 1024
       }
     ]
   }

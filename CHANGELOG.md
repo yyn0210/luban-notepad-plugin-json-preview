@@ -1,5 +1,23 @@
 # 更新日志
 
+## 1.1.0 — 2026-11-03
+
+- 节点折叠：对象/数组显示 `▾`/`▸` 标记，折叠行显示隐藏的键或元素数量。
+  - 新增 `JSON: Toggle Fold`（`Ctrl+Alt+J`），折叠/展开光标所在容器。
+  - 新增 `JSON: Fold All` 和 `JSON: Expand All`。
+  - 新增 `fold_level` 设置，控制打开文档时的初始折叠层级。
+  - 折叠状态在编辑和自动刷新时保留，根结构变化或切换文档时重置。
+- JSONPath：
+  - 新增 `JSON: Show JSONPath`，显示光标处值的路径、类型和值。
+  - 新增 `JSON: Extract JSONPath`，按选区或 `jsonpath` 设置求值并列出匹配值。
+  - 支持子属性、下标、通配符、递归下降、切片和联合；不支持的过滤表达式会明确报错。
+  - 新增 `show_paths` 设置，在预览行尾附加 JSONPath 注释。
+- JSON 元数据：新增 `JSON: Metadata` 和 Inspector 面板，显示类型计数、最大深度、
+  键与重复键、空容器、最大对象/数组、字符串统计、数字分布与范围、顶层键，
+  以及 JSON Lines 记录数。
+- 新增 `json.inspector.panel` 面板，用于显示元数据、JSONPath 查询结果和光标处路径。
+- 预览和 JSON Lines 均支持折叠、路径注释与元数据分析。
+
 ## 1.0.1 — 2026-11-03
 
 - 修复格式化/压缩在光标位于文档末尾附近时可能触发宿主 “invalid selection”

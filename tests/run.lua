@@ -132,7 +132,21 @@ local function check_panel(panel)
   end
 end
 
-local function render(text, settings)
+local function reset_folds()
+  I.fold_state.doc_key = nil
+  I.fold_state.signature = nil
+  I.fold_state.level = nil
+  for path in pairs(I.fold_state.collapsed) do
+    I.fold_state.collapsed[path] = nil
+  end
+  I.fold_state.count = 0
+  I.fold_state.seeded = false
+end
+
+local function render(text, settings, keep_folds)
+  if not keep_folds then
+    reset_folds()
+  end
   current_doc = { path = "/tmp/test.json", language = "JSON", text = text }
   current_settings = settings or {}
   notifications = {}
@@ -271,7 +285,8 @@ test("renders a tree with theme roles and a summary", function()
   truthy(role_has(boolean_line, "boolean", "true"), "boolean role missing")
   local null_line = panel.lines[index_of(panel, '"nothing"')]
   truthy(role_has(null_line, "constant", "null"), "null role missing")
-  truthy(index_of(panel, '"items": [') ~= nil, "array opening line missing")
+  truthy(index_of(panel, '"items": ') ~= nil, "array opening line missing")
+  truthy(index_of(panel, "▾ [") ~= nil, "array fold marker missing")
   truthy(index_of(panel, "]") ~= nil, "array closing line missing")
 end)
 
@@ -458,6 +473,15 @@ test("the command opens the declared panel, with a menu fallback on old hosts", 
   luban.panel = original
 end)
 
+local function any_notification(needle)
+  for _, message in ipairs(notifications) do
+    if message:find(needle, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
 test("the rich fixture keeps every invariant", function()
   local file = assert(io.open("tests/fixtures/complex.json", "rb"))
   local text = file:read("*a")
@@ -467,6 +491,242 @@ test("the rich fixture keeps every invariant", function()
   contains(panel.lines[1].text, "Object")
   truthy(index_of(panel, '"users"') ~= nil, "fixture users missing")
   truthy(index_of(panel, '"roles"') ~= nil, "fixture roles missing")
+end)
+
+test("folds and expands the node containing the cursor", function()
+  local text = '{\n  "a": {\n    "b": 1\n  },\n  "c": [1, 2]\n}'
+  local panel = render(text)
+  truthy(index_of(panel, "▾ {") ~= nil, "root fold marker missing")
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    line = 2,
+    column = 8,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  notifications = {}
+  M.toggle_fold({})
+  truthy(any_notification("folded $.a"), "fold notification missing")
+  local folded = M.render_preview({})
+  check_panel(folded)
+  truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "collapsed line missing")
+  contains(folded.lines[1].text, "1 folded")
+  notifications = {}
+  M.toggle_fold({})
+  truthy(any_notification("expanded $.a"), "expand notification missing")
+  local expanded = M.render_preview({})
+  truthy(index_of(expanded, '"a": ▾ {') ~= nil, "expanded line missing")
+end)
+
+test("applies the initial fold level", function()
+  local panel = render('{"a":{"b":{"c":1}},"d":2}', { fold_level = 2 })
+  truthy(index_of(panel, '"a": ▾ {') ~= nil, "level 2 should keep $.a expanded")
+  truthy(index_of(panel, '"b": ▸ { … 1 key }') ~= nil, "level 2 should collapse $.a.b")
+  truthy(index_of(panel, '"d": 2') ~= nil, "scalar sibling missing")
+  local level_one = render('{"a":{"b":1}}', { fold_level = 1 })
+  truthy(index_of(level_one, '"a": ▸ { … 1 key }') ~= nil, "level 1 should collapse $.a")
+end)
+
+test("folds all nested containers and expands them again", function()
+  local text = '{"a":{"b":1},"c":[1,2],"e":{}}'
+  render(text)
+  current_doc = {
+    path = "/tmp/test.json",
+    text = text,
+    line = 1,
+    column = 1,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  notifications = {}
+  M.fold_all({})
+  truthy(any_notification("folded 2 nodes"), "fold-all notification missing")
+  local folded = M.render_preview({})
+  check_panel(folded)
+  truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "$.a should be folded")
+  truthy(index_of(folded, '"c": ▸ [ … 2 items ]') ~= nil, "$.c should be folded")
+  truthy(index_of(folded, '"e": {}') ~= nil, "empty objects should not be folded")
+  truthy(index_of(folded, "▾ {") ~= nil, "root should stay expanded")
+  M.expand_all({})
+  local expanded = M.render_preview({})
+  truthy(index_of(expanded, "▸") == nil, "expand-all left a folded node")
+end)
+
+test("shows JSONPath notes when the setting is enabled", function()
+  local panel = render('{"a":{"b":[1]}}', { show_paths = true })
+  truthy(index_of(panel, "$.a") ~= nil, "$.a note missing")
+  truthy(index_of(panel, "$.a.b[0]") ~= nil, "$.a.b[0] note missing")
+end)
+
+test("generates JSONPath segments for keys and arrays", function()
+  local text = '{"a b":{"x":1},"arr":[{"k":2}]}'
+  local node = assert(parse(text))
+  local position = assert(text:find("2", 1, true))
+  local found = I.locate_node(node, position)
+  truthy(found, "cursor lookup failed")
+  eq(found.path, "$.arr[0].k")
+  eq(I.append_key_path("$", "a"), "$.a")
+  eq(I.append_key_path("$", "a b"), '$["a b"]')
+end)
+
+test("evaluates JSONPath selectors and reports syntax errors", function()
+  local root = assert(parse('{"users":[{"name":"Ada","age":36},{"name":"Bo","age":7}],"meta":{"name":"M"}}'))
+  local function paths(expression)
+    local segments = assert(I.parse_jsonpath(expression))
+    local matches = I.evaluate_jsonpath(root, segments)
+    local out = {}
+    for _, match in ipairs(matches) do
+      out[#out + 1] = match.path
+    end
+    return out
+  end
+  local names = paths("$.users[*].name")
+  eq(#names, 2)
+  eq(names[1], "$.users[0].name")
+  eq(names[2], "$.users[1].name")
+  eq(paths("$['users'][0]['name']")[1], "$.users[0].name")
+  eq(paths("$.users[-1].name")[1], "$.users[1].name")
+  eq(#paths("$..name"), 3, "recursive descent should find all names")
+  eq(#paths("$..*"), 9, "recursive wildcard should find every descendant")
+  eq(paths("$.users[::-1].name")[1], "$.users[1].name")
+  eq(#paths("$.users[0:1].name"), 1, "slice should select one item")
+  eq(#paths("$.users[0,1].name"), 2, "union should select both items")
+  local ok, err = pcall(I.parse_jsonpath, "users[*]")
+  truthy(not ok, "missing root should be rejected")
+  contains(err.message, "must start with '$'")
+  ok, err = pcall(I.parse_jsonpath, "$.users[?(@.age)]")
+  truthy(not ok, "filters should be reported as unsupported")
+  contains(err.message, "Expected a quoted key")
+end)
+
+test("renders JSONPath results in the inspector", function()
+  current_doc = {
+    path = "/tmp/jsonpath.json",
+    text = '{"users":[{"name":"Ada"},{"name":"Bo"}]}',
+    line = 1,
+    column = 1,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  I.inspector_state.mode = "jsonpath"
+  I.inspector_state.expression = "$.users[*].name"
+  local panel = M.render_inspector({})
+  check_panel(panel)
+  contains(panel.lines[1].text, "JSONPath Results")
+  truthy(index_of(panel, "Matches     2") ~= nil, "match count missing")
+  truthy(index_of(panel, "Ada") ~= nil, "first match missing")
+  truthy(index_of(panel, "Bo") ~= nil, "second match missing")
+end)
+
+test("reports JSON metadata including duplicate keys and depth", function()
+  local text = '{\n  "a": [1, 2],\n  "b": "xy",\n  "a": 3,\n  "c": null,\n  "d": true,\n  "e": {}\n}'
+  current_doc = {
+    path = "/tmp/metadata.json",
+    text = text,
+    line = 1,
+    column = 1,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  local analysis = assert(I.analysis_document("test"))
+  local panel = I.render_metadata(analysis)
+  check_panel(panel)
+  eq(panel.title, "JSON Metadata")
+  truthy(index_of(panel, "Objects") ~= nil, "type counts missing")
+  truthy(index_of(panel, "Values") ~= nil, "values section missing")
+  truthy(index_of(panel, "Duplicate keys") ~= nil, "duplicate section missing")
+  truthy(index_of(panel, "Max depth") ~= nil, "depth missing")
+  truthy(index_of(panel, "Top-level keys") ~= nil, "top-level keys missing")
+  notifications = {}
+  M.show_metadata({})
+  eq(I.inspector_state.mode, "metadata")
+  truthy(any_notification("open:json.inspector.panel"), "inspector was not opened")
+end)
+
+test("extracts JSONPath from the selection or the setting", function()
+  local text = '{"query":"$.users[0].name","users":[{"name":"Ada"}]}'
+  local expression = "$.users[0].name"
+  local byte_start = assert(text:find(expression, 1, true))
+  local start_char = utf8.len(text:sub(1, byte_start - 1))
+  current_doc = {
+    path = "/tmp/extract.json",
+    text = text,
+    line = 1,
+    column = 1,
+    selection_start = start_char,
+    selection_end = start_char + #expression,
+  }
+  current_settings = {}
+  notifications = {}
+  M.extract_jsonpath({})
+  eq(I.inspector_state.expression, expression)
+  truthy(any_notification("open:json.inspector.panel"), "inspector was not opened")
+  current_doc.selection_start = 0
+  current_doc.selection_end = 0
+  current_settings = { jsonpath = "$.users[*].name" }
+  notifications = {}
+  M.extract_jsonpath({})
+  eq(I.inspector_state.expression, "$.users[*].name")
+  current_settings = { jsonpath = "users" }
+  notifications = {}
+  M.extract_jsonpath({})
+  truthy(any_notification("invalid JSONPath"), "invalid expression was not reported")
+end)
+
+test("shows the JSONPath of the value at the cursor", function()
+  local text = '{"users":[{"name":"Ada"}]}'
+  local starts = I.compute_line_starts(text)
+  local position = assert(text:find("Ada", 1, true))
+  local location = I.locate(text, starts, position)
+  current_doc = {
+    path = "/tmp/showpath.json",
+    text = text,
+    line = location.line,
+    column = location.column,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  notifications = {}
+  M.show_jsonpath({})
+  eq(I.inspector_state.path, "$.users[0].name")
+  truthy(any_notification("JSONPath: $.users[0].name"), "path notification missing")
+  local panel = M.render_inspector({})
+  check_panel(panel)
+  eq(panel.title, "JSONPath at Cursor")
+  contains(panel.lines[1].text, "Path")
+  truthy(index_of(panel, "Ada") ~= nil, "value missing from the inspector")
+end)
+
+test("folds, analyzes and queries JSON Lines records", function()
+  local text = '{"a":1}\n{"b":{"c":2}}\n'
+  local panel = render(text)
+  contains(panel.lines[1].text, "JSON Lines · 2 records")
+  current_doc = {
+    path = "/tmp/test.json",
+    text = text,
+    line = 2,
+    column = 7,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  notifications = {}
+  M.toggle_fold({})
+  truthy(any_notification("folded $.b"), "JSON Lines fold notification missing")
+  local folded = M.render_preview({})
+  check_panel(folded)
+  truthy(index_of(folded, '"b": ▸ { … 1 key }') ~= nil, "JSON Lines fold missing")
+  local analysis = assert(I.analysis_document("test"))
+  local metadata = I.render_metadata(analysis)
+  check_panel(metadata)
+  truthy(index_of(metadata, "2 records") ~= nil, "record count missing")
+  local results = I.render_jsonpath_results(analysis, "$.b.c")
+  check_panel(results)
+  truthy(index_of(results, "Line 2 · $.b.c = 2") ~= nil, "JSON Lines JSONPath result missing")
 end)
 
 io.write(string.format("\n%d passed, %d failed\n", PASSED, FAILED))
