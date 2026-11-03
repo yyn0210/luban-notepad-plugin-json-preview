@@ -1,0 +1,98 @@
+{
+  "id": "io.github.yyn0210.json-preview",
+  "name": "JSON Preview",
+  "version": "1.0.0",
+  "api_version": 1,
+  "main": "main.lua",
+  "description": "Tree-style JSON preview in a side panel with syntax colors, error locations, duplicate-key hints, JSON Lines support and format/minify commands.",
+  "author": "yyn0210",
+  "permissions": [],
+  "activate": "activate",
+  "contributes": {
+    "commands": [
+      {
+        "id": "json.preview",
+        "label": "JSON: Preview",
+        "description": "Open or refresh the JSON preview",
+        "entry": "open_preview",
+        "default_keybinding": "ctrl+shift+j",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.format",
+        "label": "JSON: Format Document",
+        "description": "Pretty-print the active JSON document",
+        "entry": "format_document",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.minify",
+        "label": "JSON: Minify Document",
+        "description": "Compact the active JSON document",
+        "entry": "minify_document",
+        "when": "edit_text"
+      },
+      {
+        "id": "json.validate",
+        "label": "JSON: Validate",
+        "description": "Check the active document and report JSON problems",
+        "entry": "validate_document",
+        "when": "edit_text"
+      }
+    ],
+    "menus": [
+      {
+        "menu": "plugins",
+        "command": "json.preview"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.format"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.minify"
+      },
+      {
+        "menu": "plugins",
+        "command": "json.validate"
+      }
+    ],
+    "panels": [
+      {
+        "id": "json.preview.panel",
+        "title": "JSON Preview",
+        "entry": "render_preview",
+        "placement": "right",
+        "width": 720,
+        "refresh": "edit"
+      }
+    ],
+    "settings": [
+      {
+        "key": "indent",
+        "type": "number",
+        "label": "Indent width",
+        "description": "Spaces per nesting level in the preview and in formatted documents.",
+        "default": 2,
+        "min": 1,
+        "max": 8,
+        "step": 1
+      },
+      {
+        "key": "sort_keys",
+        "type": "boolean",
+        "label": "Sort keys in the preview",
+        "description": "Sort object keys alphabetically in the preview only. Formatting keeps the original order.",
+        "default": false
+      },
+      {
+        "key": "json_lines",
+        "type": "boolean",
+        "label": "Preview JSON Lines",
+        "description": "When the document is not a single JSON value, preview each non-empty line as one record if every line is valid JSON.",
+        "default": true
+      }
+    ]
+  }
+}

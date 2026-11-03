@@ -1,0 +1,53 @@
+{
+  "service": "luban-notepad",
+  "version": "1.0.0",
+  "enabled": true,
+  "timeout_ms": 1500,
+  "threshold": 0.75,
+  "tags": ["editor", "lua", "预览"],
+  "owner": {
+    "name": "Example Team",
+    "email": "team@example.com",
+    "contacts": [
+      { "kind": "chat", "value": "luban-dev" },
+      { "kind": "mail", "value": null }
+    ]
+  },
+  "users": [
+    {
+      "id": 1,
+      "name": "Ada",
+      "roles": ["admin", "editor"],
+      "profile": {
+        "locale": "zh-CN",
+        "bio": "Writes \"quoted\" text and\nnew lines.",
+        "avatar": "https://example.com/ada.png"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Lin",
+      "roles": ["viewer"],
+      "profile": {
+        "locale": "en-US",
+        "bio": "Prefers compact JSON.",
+        "avatar": null
+      }
+    }
+  ],
+  "limits": {
+    "max_file_bytes": 536870912,
+    "max_depth": 256,
+    "allowed_extensions": [".json", ".jsonl", ".jsonc"]
+  },
+  "matrix": [
+    [1, 2, 3],
+    [4, 5, 6],
+    [7, 8, 9]
+  ],
+  "empty_object": {},
+  "empty_array": [],
+  "escaped": "tab\tnewline\nslash\\quote\"unicode\u00e9",
+  "integer_ids": [-1, 0, 1, 9007199254740991],
+  "scientific": [1e-9, 2.5E+10, -3.0e0]
+}
