@@ -275,7 +275,7 @@ end)
 
 test("renders a tree with theme roles and a summary", function()
   local panel = render('{"name":"x","count":2,"ok":true,"nothing":null,"items":[1]}')
-  truthy(index_of(panel, "Object · 5 keys") ~= nil, "summary missing")
+  contains(panel.title, "Object · 5 keys", "summary missing from title")
   local key_line = panel.lines[index_of(panel, '"name"')]
   truthy(role_has(key_line, "property", '"name"'), "key role missing")
   truthy(role_has(key_line, "string", '"x"'), "string role missing")
@@ -286,7 +286,7 @@ test("renders a tree with theme roles and a summary", function()
   local null_line = panel.lines[index_of(panel, '"nothing"')]
   truthy(role_has(null_line, "constant", "null"), "null role missing")
   truthy(index_of(panel, '"items": ') ~= nil, "array opening line missing")
-  truthy(index_of(panel, "▾ [") ~= nil, "array fold marker missing")
+  truthy(index_of(panel, '▾ "items": [') ~= nil, "array fold marker missing")
   truthy(index_of(panel, "]") ~= nil, "array closing line missing")
 end)
 
@@ -400,13 +400,13 @@ end)
 
 test("normalizes CRLF and a UTF-8 BOM", function()
   local panel = render("\239\187\191{\r\n  \"a\": 1\r\n}\r\n")
-  truthy(index_of(panel, "Object · 1 key") ~= nil, "summary missing")
+  contains(panel.title, "Object · 1 key", "summary missing from title")
   truthy(index_of(panel, '"a": 1') ~= nil, "value missing")
 end)
 
 test("detects JSON Lines when every non-empty line is valid", function()
   local panel = render('{"a":1}\n{"b":[2,3]}\n\n{"c":true}\n')
-  truthy(index_of(panel, "JSON Lines · 3 records") ~= nil, "summary missing")
+  contains(panel.title, "JSON Lines · 3 records", "summary missing from title")
   truthy(index_of(panel, "Line 1 · Object · 1 key") ~= nil, "record 1 header missing")
   truthy(index_of(panel, "Line 2 · Object · 1 key") ~= nil, "record 2 header missing")
   truthy(index_of(panel, "Line 4 · Object · 1 key") ~= nil, "record 3 header missing")
@@ -538,11 +538,49 @@ test("renders the three action rows and toggles all folds", function()
   local folded = M.render_preview({})
   contains(folded.lines[1].text, "[ Expand All ]")
   eq(folded.lines[1].command, "json.fold.none")
-  truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "nested node was not folded")
+  truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "nested node was not folded")
   M.toggle_all_folds({})
   local expanded = M.render_preview({})
   contains(expanded.lines[1].text, "[ Fold All ]")
   truthy(index_of(expanded, "▸") == nil, "toggle-all did not expand")
+end)
+
+test("uses compact header actions on hosts with panel API version 2", function()
+  local original = luban.panel
+  local ok, err = pcall(function()
+    luban.panel = { open = original.open, version = 2 }
+    local text = '{"a":{"b":1},"c":[1,2]}'
+    reset_folds()
+    current_doc = {
+      path = "/tmp/actions.json",
+      text = text,
+      line = 1,
+      column = 1,
+      selection_start = 0,
+      selection_end = 0,
+    }
+    current_settings = {}
+    local panel = M.render_preview({})
+    check_panel(panel)
+    eq(panel.lines[1].style, "rule")
+    truthy(panel.actions ~= nil, "panel actions missing")
+    eq(#panel.actions, 3)
+    eq(panel.actions[1].label, "Fold All")
+    eq(panel.actions[1].command, "json.fold.toggle-all")
+    eq(panel.actions[2].command, "json.path.action")
+    eq(panel.actions[3].command, "json.metadata")
+    truthy(index_of(panel, "[ Fold All ]") == nil, "fallback toolbar should be omitted")
+    truthy(index_of(panel, '▾ "a": {') ~= nil, "tree missing")
+    M.toggle_all_folds({})
+    local folded = M.render_preview({})
+    check_panel(folded)
+    eq(folded.actions[1].label, "Expand All")
+    truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "action fold missing")
+  end)
+  luban.panel = original
+  if not ok then
+    error(err)
+  end
 end)
 
 test("the toolbar JSONPath action follows the editor selection", function()
@@ -582,7 +620,7 @@ test("the rich fixture keeps every invariant", function()
   file:close()
   local panel = render(text)
   truthy(#panel.lines > 20, "fixture produced too few lines")
-  truthy(index_of(panel, "Object") ~= nil, "summary missing")
+  contains(panel.title, "Object", "summary missing from title")
   truthy(index_of(panel, '"users"') ~= nil, "fixture users missing")
   truthy(index_of(panel, '"roles"') ~= nil, "fixture roles missing")
 end)
@@ -605,22 +643,21 @@ test("folds and expands the node containing the cursor", function()
   truthy(any_notification("folded $.a"), "fold notification missing")
   local folded = M.render_preview({})
   check_panel(folded)
-  truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "collapsed line missing")
-  truthy(index_of(folded, "1 folded") ~= nil, "folded summary missing")
+  truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "collapsed line missing")
   notifications = {}
   M.toggle_fold({})
   truthy(any_notification("expanded $.a"), "expand notification missing")
   local expanded = M.render_preview({})
-  truthy(index_of(expanded, '"a": ▾ {') ~= nil, "expanded line missing")
+  truthy(index_of(expanded, '▾ "a": {') ~= nil, "expanded line missing")
 end)
 
 test("applies the initial fold level", function()
   local panel = render('{"a":{"b":{"c":1}},"d":2}', { fold_level = 2 })
-  truthy(index_of(panel, '"a": ▾ {') ~= nil, "level 2 should keep $.a expanded")
-  truthy(index_of(panel, '"b": ▸ { … 1 key }') ~= nil, "level 2 should collapse $.a.b")
+  truthy(index_of(panel, '▾ "a": {') ~= nil, "level 2 should keep $.a expanded")
+  truthy(index_of(panel, '  ▸ "b": { … 1 key }') ~= nil, "level 2 should collapse $.a.b")
   truthy(index_of(panel, '"d": 2') ~= nil, "scalar sibling missing")
   local level_one = render('{"a":{"b":1}}', { fold_level = 1 })
-  truthy(index_of(level_one, '"a": ▸ { … 1 key }') ~= nil, "level 1 should collapse $.a")
+  truthy(index_of(level_one, '▸ "a": { … 1 key }') ~= nil, "level 1 should collapse $.a")
 end)
 
 test("folds all nested containers and expands them again", function()
@@ -639,8 +676,8 @@ test("folds all nested containers and expands them again", function()
   truthy(any_notification("folded 2 nodes"), "fold-all notification missing")
   local folded = M.render_preview({})
   check_panel(folded)
-  truthy(index_of(folded, '"a": ▸ { … 1 key }') ~= nil, "$.a should be folded")
-  truthy(index_of(folded, '"c": ▸ [ … 2 items ]') ~= nil, "$.c should be folded")
+  truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "$.a should be folded")
+  truthy(index_of(folded, '▸ "c": [ … 2 items ]') ~= nil, "$.c should be folded")
   truthy(index_of(folded, '"e": {}') ~= nil, "empty objects should not be folded")
   truthy(index_of(folded, "▾ {") ~= nil, "root should stay expanded")
   M.expand_all({})
@@ -799,7 +836,7 @@ end)
 test("folds, analyzes and queries JSON Lines records", function()
   local text = '{"a":1}\n{"b":{"c":2}}\n'
   local panel = render(text)
-  truthy(index_of(panel, "JSON Lines · 2 records") ~= nil, "summary missing")
+  contains(panel.title, "JSON Lines · 2 records", "summary missing from title")
   current_doc = {
     path = "/tmp/test.json",
     text = text,
@@ -813,7 +850,7 @@ test("folds, analyzes and queries JSON Lines records", function()
   truthy(any_notification("folded $.b"), "JSON Lines fold notification missing")
   local folded = M.render_preview({})
   check_panel(folded)
-  truthy(index_of(folded, '"b": ▸ { … 1 key }') ~= nil, "JSON Lines fold missing")
+  truthy(index_of(folded, '▸ "b": { … 1 key }') ~= nil, "JSON Lines fold missing")
   local analysis = assert(I.analysis_document("test"))
   local metadata = I.render_metadata(analysis)
   check_panel(metadata)

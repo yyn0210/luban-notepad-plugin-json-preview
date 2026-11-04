@@ -910,6 +910,14 @@ local function count_visible_folded(node, fold_path, collapsed)
   return 0
 end
 
+local function folded_count(roots, collapsed)
+  local total = 0
+  for _, root in ipairs(roots or {}) do
+    total = total + count_visible_folded(root.node, root.fold_prefix or "$", collapsed or {})
+  end
+  return total
+end
+
 local function fold_all(roots)
   clear_collapsed()
   for _, root in ipairs(roots) do
@@ -1106,7 +1114,7 @@ local function indent_cache(indent)
   return cache
 end
 
-local function finish_line(tokens, notes)
+local function finish_line(tokens, notes, line_style)
   local parts = {}
   local spans = {}
   for _, token in ipairs(tokens) do
@@ -1130,12 +1138,12 @@ local function finish_line(tokens, notes)
     text = " "
   end
   if #text > MAX_LINE_BYTES then
-    return { text = utf8_prefix(text, MAX_LINE_BYTES - 1) .. "…", style = "code" }
+    return { text = utf8_prefix(text, MAX_LINE_BYTES - 1) .. "…", style = line_style or "code" }
   end
   if #spans > 400 then
     spans = nil
   end
-  return { text = text, style = "code", spans = spans }
+  return { text = text, style = line_style or "code", spans = spans }
 end
 
 local function push_line(renderer, line)
@@ -1192,6 +1200,24 @@ local function push_toolbar(renderer, folded)
   end
 end
 
+local function panel_supports_actions()
+  return type(luban) == "table"
+    and type(luban.panel) == "table"
+    and type(luban.panel.version) == "number"
+    and luban.panel.version >= 2
+end
+
+local function build_panel_actions(folded)
+  return {
+    {
+      label = folded > 0 and "Expand All" or "Fold All",
+      command = "json.fold.toggle-all",
+    },
+    { label = "JSONPath", command = "json.path.action" },
+    { label = "Metadata", command = "json.metadata" },
+  }
+end
+
 local function duplicate_note(pair, line_for_pos)
   local first_line = nil
   if line_for_pos and pair.duplicate_of then
@@ -1228,21 +1254,44 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
   display_path = display_path or "$"
   fold_path = fold_path or "$"
   local indents = opts.indents
-  local tokens = { { text = indents[depth] } }
+  local object_pairs = nil
+  local array_count = 0
+  if node.type == "object" then
+    object_pairs = ordered_pairs(node, opts.sort_keys)
+  elseif node.type == "array" then
+    array_count = #node.items
+  end
+  local container_count = object_pairs and #object_pairs or array_count
+  local collapsed = container_count > 0
+    and opts.collapsed
+    and opts.collapsed[fold_path]
+  local tokens = {}
+  if container_count > 0 then
+    -- Keep the triangle in the indent gutter so keys stay aligned with scalar
+    -- siblings, matching common JSON tree viewers.
+    local gutter = indents[math.max(0, depth - 1)]
+    tokens[#tokens + 1] = { text = gutter }
+    tokens[#tokens + 1] = { text = collapsed and "▸ " or "▾ ", style = "muted" }
+    local padding = #indents[depth] - #gutter - 2
+    if padding > 0 then
+      tokens[#tokens + 1] = { text = string.rep(" ", padding) }
+    end
+  else
+    tokens[#tokens + 1] = { text = indents[depth] }
+  end
   for _, token in ipairs(prefix) do
     tokens[#tokens + 1] = token
   end
   if node.type == "object" then
-    local pairs = ordered_pairs(node, opts.sort_keys)
+    local pairs = object_pairs
     if #pairs == 0 then
       tokens[#tokens + 1] = { text = "{}", role = "punctuation.bracket" }
       if suffix ~= "" then
         tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
       end
-      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path), opts.line_style))
     end
-    if opts.collapsed and opts.collapsed[fold_path] then
-      tokens[#tokens + 1] = { text = "▸ ", style = "muted" }
+    if collapsed then
       tokens[#tokens + 1] = { text = "{", role = "punctuation.bracket" }
       tokens[#tokens + 1] = {
         text = string.format(" … %d %s ", #pairs, plural(#pairs, "key", "keys")),
@@ -1252,11 +1301,10 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
       if suffix ~= "" then
         tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
       end
-      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path), opts.line_style))
     end
-    tokens[#tokens + 1] = { text = "▾ ", style = "muted" }
     tokens[#tokens + 1] = { text = "{", role = "punctuation.bracket" }
-    if not push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path))) then
+    if not push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path), opts.line_style)) then
       return false
     end
     for index, pair in ipairs(pairs) do
@@ -1275,38 +1323,37 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
         return false
       end
     end
+    local close_indent = depth == 0 and string.rep(" ", opts.indent) or indents[depth]
     local close_tokens = {
-      { text = indents[depth] },
+      { text = close_indent },
       { text = "}", role = "punctuation.bracket" },
     }
     if suffix ~= "" then
       close_tokens[#close_tokens + 1] = { text = suffix, role = "punctuation" }
     end
-    return push_line(renderer, finish_line(close_tokens))
+    return push_line(renderer, finish_line(close_tokens, nil, opts.line_style))
   elseif node.type == "array" then
-    if #node.items == 0 then
+    if array_count == 0 then
       tokens[#tokens + 1] = { text = "[]", role = "punctuation.bracket" }
       if suffix ~= "" then
         tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
       end
-      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path), opts.line_style))
     end
-    if opts.collapsed and opts.collapsed[fold_path] then
-      tokens[#tokens + 1] = { text = "▸ ", style = "muted" }
+    if collapsed then
       tokens[#tokens + 1] = { text = "[", role = "punctuation.bracket" }
       tokens[#tokens + 1] = {
-        text = string.format(" … %d %s ", #node.items, plural(#node.items, "item", "items")),
+        text = string.format(" … %d %s ", array_count, plural(array_count, "item", "items")),
         style = "muted",
       }
       tokens[#tokens + 1] = { text = "]", role = "punctuation.bracket" }
       if suffix ~= "" then
         tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
       end
-      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path)))
+      return push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path), opts.line_style))
     end
-    tokens[#tokens + 1] = { text = "▾ ", style = "muted" }
     tokens[#tokens + 1] = { text = "[", role = "punctuation.bracket" }
-    if not push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path))) then
+    if not push_line(renderer, finish_line(tokens, combine_notes(notes, opts, display_path), opts.line_style)) then
       return false
     end
     for index, item in ipairs(node.items) do
@@ -1316,14 +1363,15 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
         return false
       end
     end
+    local close_indent = depth == 0 and string.rep(" ", opts.indent) or indents[depth]
     local close_tokens = {
-      { text = indents[depth] },
+      { text = close_indent },
       { text = "]", role = "punctuation.bracket" },
     }
     if suffix ~= "" then
       close_tokens[#close_tokens + 1] = { text = suffix, role = "punctuation" }
     end
-    return push_line(renderer, finish_line(close_tokens))
+    return push_line(renderer, finish_line(close_tokens, nil, opts.line_style))
   end
   local value_notes = {}
   if notes then
@@ -1351,7 +1399,7 @@ render_value = function(renderer, node, depth, prefix, suffix, notes, opts, line
   if suffix ~= "" then
     tokens[#tokens + 1] = { text = suffix, role = "punctuation" }
   end
-  return push_line(renderer, finish_line(tokens, combine_notes(value_notes, opts, display_path)))
+  return push_line(renderer, finish_line(tokens, combine_notes(value_notes, opts, display_path), opts.line_style))
 end
 
 local function parse_json_lines(text)
@@ -1375,20 +1423,12 @@ end
 
 local function render_valid(text, root, opts, roots)
   local renderer = { lines = {}, count = 0, overflow = false }
-  local duplicates = count_duplicates(root)
-  local summary = describe_node(root) .. " · " .. format_bytes(#text)
-  if duplicates > 0 then
-    summary = summary .. " · " .. duplicates .. " " .. plural(duplicates, "duplicate key", "duplicate keys")
+  local folded = folded_count(roots, opts.collapsed)
+  if opts.actions_supported then
+    push_line(renderer, { text = "", style = "rule" })
+  else
+    push_toolbar(renderer, folded)
   end
-  local folded = 0
-  for _, root in ipairs(roots or {}) do
-    folded = folded + count_visible_folded(root.node, root.fold_prefix or "$", opts.collapsed or {})
-  end
-  if folded > 0 then
-    summary = summary .. " · " .. folded .. " folded"
-  end
-  push_toolbar(renderer, folded)
-  push_line(renderer, { text = summary, style = "muted" })
   local starts = compute_line_starts(text)
   local function line_for_pos(pos)
     return line_number_at(starts, pos)
@@ -1406,28 +1446,12 @@ end
 
 local function render_json_lines(text, records, opts, roots)
   local renderer = { lines = {}, count = 0, overflow = false }
-  local duplicates = 0
-  for _, record in ipairs(records) do
-    duplicates = duplicates + count_duplicates(record.root)
+  local folded = folded_count(roots, opts.collapsed)
+  if opts.actions_supported then
+    push_line(renderer, { text = "", style = "rule" })
+  else
+    push_toolbar(renderer, folded)
   end
-  local summary = string.format(
-    "JSON Lines · %d %s · %s",
-    #records,
-    plural(#records, "record", "records"),
-    format_bytes(#text)
-  )
-  if duplicates > 0 then
-    summary = summary .. " · " .. duplicates .. " " .. plural(duplicates, "duplicate key", "duplicate keys")
-  end
-  local folded = 0
-  for _, root in ipairs(roots or {}) do
-    folded = folded + count_visible_folded(root.node, root.fold_prefix or "$", opts.collapsed or {})
-  end
-  if folded > 0 then
-    summary = summary .. " · " .. folded .. " folded"
-  end
-  push_toolbar(renderer, folded)
-  push_line(renderer, { text = summary, style = "muted" })
   for _, record in ipairs(records) do
     local record_summary = string.format(
       "Line %d · %s",
@@ -1518,11 +1542,20 @@ local function render_error(text, err, truncated)
   return lines
 end
 
-local function document_title(doc)
+local function document_title(doc, description)
   local path = doc.path
+  local name = nil
   if type(path) == "string" and path ~= "" then
-    local name = path:match("([^/\\]+)$") or path
+    name = path:match("([^/\\]+)$") or path
+  end
+  if name then
+    if description then
+      return name .. " — " .. description
+    end
     return name .. " — JSON Preview"
+  end
+  if description then
+    return description
   end
   return "JSON Preview"
 end
@@ -1551,7 +1584,14 @@ local function render_document(doc, opts)
         style = "muted",
       }
     end
-    return { title = document_title(doc), lines = lines }
+    local result = {
+      title = document_title(doc, describe_node(root)),
+      lines = lines,
+    }
+    if opts.actions_supported then
+      result.actions = build_panel_actions(folded_count(roots, opts.collapsed))
+    end
+    return result
   end
   if type(root) ~= "table" or not root.json_error then
     return {
@@ -1567,7 +1607,14 @@ local function render_document(doc, opts)
         roots[index] = { node = record.root, fold_prefix = "L" .. record.source_line .. "$" }
       end
       ensure_fold_state(doc, roots, opts.fold_level)
-      return { title = document_title(doc), lines = render_json_lines(text, records, opts, roots) }
+      local result = {
+        title = document_title(doc, string.format("JSON Lines · %d records", #records)),
+        lines = render_json_lines(text, records, opts, roots),
+      }
+      if opts.actions_supported then
+        result.actions = build_panel_actions(folded_count(roots, opts.collapsed))
+      end
+      return result
     end
   end
   return { title = document_title(doc), lines = render_error(text, root, truncated) }
@@ -1626,6 +1673,8 @@ local function preview_options()
     fold_level = setting_int("fold_level", 0, 0, 16),
     show_paths = setting_bool("show_paths", false),
     collapsed = fold_state.collapsed,
+    line_style = "table",
+    actions_supported = panel_supports_actions(),
     indents = indent_cache(indent),
   }
 end
