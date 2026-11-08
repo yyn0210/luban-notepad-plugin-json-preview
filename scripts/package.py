@@ -22,7 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "plugin.json"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
-FILES = ("plugin.json", "main.lua", "README.md", "LICENSE", "CHANGELOG.md")
+FILES = ("plugin.json", "main.lua", "json/parser.lua", "json/display.lua",
+         "json/path.lua", "json/tree.lua", "json/meta.lua",
+         "README.md", "LICENSE", "CHANGELOG.md")
 MAX_MANIFEST = 256 * 1024
 MAX_MAIN = 2 * 1024 * 1024
 
@@ -42,8 +44,16 @@ def load_manifest() -> dict:
         raise SystemExit(f"invalid plugin id: {manifest['id']}")
     if not SEMVER_RE.match(manifest["version"]):
         raise SystemExit(f"invalid version: {manifest['version']}")
-    if manifest["api_version"] != 1:
-        raise SystemExit("this plugin targets api_version 1")
+    if manifest["api_version"] != 2:
+        raise SystemExit("this plugin targets api_version 2")
+    # Every Lua module main.lua requires must be packaged. The zip keeps the
+    # plugin-root layout (json/parser.lua etc.) so the sandboxed in-plugin
+    # `require` can resolve `json.parser` -> json/parser.lua.
+    required_modules = ("json/parser.lua", "json/display.lua", "json/path.lua",
+                        "json/tree.lua", "json/meta.lua")
+    for module in required_modules:
+        if not (ROOT / module).is_file():
+            raise SystemExit(f"module file not found: {module}")
     main = (ROOT / manifest["main"]).resolve()
     if ROOT not in main.parents:
         raise SystemExit("main escapes the plugin directory")
@@ -63,7 +73,7 @@ def build_zip(manifest: dict, target: io.BufferedIOBase) -> None:
             path = ROOT / name
             if not path.is_file():
                 continue
-            info = zipfile.ZipInfo(name, date_time=(2026, 11, 3, 0, 0, 0))
+            info = zipfile.ZipInfo(name, date_time=(2026, 11, 8, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
             archive.writestr(info, path.read_bytes())
@@ -84,6 +94,9 @@ def main() -> int:
             names = archive.namelist()
             if names.count("plugin.json") != 1:
                 raise SystemExit("the archive must contain exactly one plugin.json")
+            for name in FILES:
+                if name.endswith(".lua") and names.count(name) != 1:
+                    raise SystemExit(f"the archive must contain {name}")
             with archive.open("plugin.json") as handle:
                 packaged = json.load(handle)
             if packaged.get("id") != manifest["id"] or packaged.get("version") != manifest["version"]:

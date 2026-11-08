@@ -1,12 +1,23 @@
--- Standalone tests for main.lua (Lua 5.4).
+-- Standalone tests for the JSON Preview plugin (Lua 5.4, plugin API v2).
 --
 -- Run from the repository root:
 --   lua5.4 tests/run.lua
 --
--- The harness supplies the same `luban` surface the host exposes. It never
--- runs inside the app sandbox, so `os` and `io` are available here only.
+-- The harness supplies the same `luban` surface a v2 host exposes: function
+-- values for events, document/panel/command/timer tables, mutators that
+-- return nil and raise on failure. It never runs inside the app sandbox, so
+-- `os` and `io` are available here only, and plain `require` loads the plugin
+-- modules from the repository root (json.parser -> json/parser.lua).
 
 local PLUGIN_MAIN = os.getenv("PLUGIN_MAIN") or "main.lua"
+
+-- Modules live in json/ next to main.lua; make them requireable no matter
+-- how the harness was invoked.
+local script_dir = (arg and arg[0] or ""):match("^(.*)[/\\]") or "."
+package.path = "./?.lua;./json/?.lua;"
+  .. script_dir .. "/?.lua;" .. script_dir .. "/json/?.lua;"
+  .. script_dir .. "/../?.lua;" .. script_dir .. "/../json/?.lua;"
+  .. package.path
 
 local current_doc = nil
 local current_settings = {}
@@ -14,6 +25,325 @@ local notifications = {}
 local updated_text = nil
 local updated_selection = nil
 local update_result = true
+local panel_opens = {}
+local panel_refreshes = {}
+local handlers = {}
+local fs_files = {}
+local fs_writes = {}
+local cursor_calls = {}
+local command_calls = {}
+
+-- ===========================================================================
+-- Minimal JSON encode/decode for the stub host (state.json payloads only)
+-- ===========================================================================
+
+local function json_quote(text)
+  local out = { '"' }
+  for index = 1, #text do
+    local byte = text:byte(index)
+    local ch = text:sub(index, index)
+    if byte == 34 then
+      out[#out + 1] = '\\"'
+    elseif byte == 92 then
+      out[#out + 1] = "\\\\"
+    elseif byte == 10 then
+      out[#out + 1] = "\\n"
+    elseif byte == 13 then
+      out[#out + 1] = "\\r"
+    elseif byte == 9 then
+      out[#out + 1] = "\\t"
+    elseif byte < 32 then
+      out[#out + 1] = string.format("\\u%04x", byte)
+    else
+      out[#out + 1] = ch
+    end
+  end
+  out[#out + 1] = '"'
+  return table.concat(out)
+end
+
+local function json_encode(value)
+  local kind = type(value)
+  if value == nil then
+    return "null"
+  elseif kind == "boolean" then
+    return value and "true" or "false"
+  elseif kind == "number" then
+    if value == math.floor(value) and math.abs(value) < 2 ^ 53 then
+      return string.format("%d", value)
+    end
+    return tostring(value)
+  elseif kind == "string" then
+    return json_quote(value)
+  elseif kind == "table" then
+    if #value > 0 or next(value) == nil then
+      local parts = {}
+      for index = 1, #value do
+        parts[index] = json_encode(value[index])
+      end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
+    local keys = {}
+    for key in pairs(value) do
+      keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    local parts = {}
+    for _, key in ipairs(keys) do
+      parts[#parts + 1] = json_quote(key) .. ":" .. json_encode(value[key])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  end
+  error("stub json.encode cannot handle " .. kind)
+end
+
+local function json_decode(text)
+  local pos = 1
+  local n = #text
+  local function skip_ws()
+    while pos <= n do
+      local ch = text:sub(pos, pos)
+      if ch == " " or ch == "\t" or ch == "\n" or ch == "\r" then
+        pos = pos + 1
+      else
+        break
+      end
+    end
+  end
+  local parse_value
+  local function parse_string()
+    pos = pos + 1
+    local out = {}
+    while pos <= n do
+      local ch = text:sub(pos, pos)
+      if ch == '"' then
+        pos = pos + 1
+        return table.concat(out)
+      elseif ch == "\\" then
+        pos = pos + 1
+        local escape = text:sub(pos, pos)
+        if escape == "n" then
+          out[#out + 1] = "\n"
+          pos = pos + 1
+        elseif escape == "t" then
+          out[#out + 1] = "\t"
+          pos = pos + 1
+        elseif escape == "r" then
+          out[#out + 1] = "\r"
+          pos = pos + 1
+        elseif escape == "b" then
+          out[#out + 1] = "\b"
+          pos = pos + 1
+        elseif escape == "f" then
+          out[#out + 1] = "\f"
+          pos = pos + 1
+        elseif escape == "u" then
+          out[#out + 1] = utf8.char(tonumber(text:sub(pos + 1, pos + 4), 16))
+          pos = pos + 5
+        else
+          out[#out + 1] = escape
+          pos = pos + 1
+        end
+      else
+        out[#out + 1] = ch
+        pos = pos + 1
+      end
+    end
+    error("unterminated string in test JSON")
+  end
+  local function parse_number()
+    local start = pos
+    while pos <= n and text:sub(pos, pos):match("[0-9eE%.%+%-]") do
+      pos = pos + 1
+    end
+    return tonumber(text:sub(start, pos - 1))
+  end
+  parse_value = function()
+    skip_ws()
+    local ch = text:sub(pos, pos)
+    if ch == '"' then
+      return parse_string()
+    elseif ch == "{" then
+      pos = pos + 1
+      local object = {}
+      skip_ws()
+      if text:sub(pos, pos) == "}" then
+        pos = pos + 1
+        return object
+      end
+      while true do
+        skip_ws()
+        local key = parse_string()
+        skip_ws()
+        pos = pos + 1
+        object[key] = parse_value()
+        skip_ws()
+        local separator = text:sub(pos, pos)
+        pos = pos + 1
+        if separator == "}" then
+          return object
+        end
+      end
+    elseif ch == "[" then
+      pos = pos + 1
+      local array = {}
+      skip_ws()
+      if text:sub(pos, pos) == "]" then
+        pos = pos + 1
+        return array
+      end
+      while true do
+        array[#array + 1] = parse_value()
+        skip_ws()
+        local separator = text:sub(pos, pos)
+        pos = pos + 1
+        if separator == "]" then
+          return array
+        end
+      end
+    elseif ch == "t" then
+      pos = pos + 4
+      return true
+    elseif ch == "f" then
+      pos = pos + 5
+      return false
+    elseif ch == "n" then
+      pos = pos + 4
+      return nil
+    else
+      return parse_number()
+    end
+  end
+  return parse_value()
+end
+
+-- ===========================================================================
+-- The v2 host stub
+-- ===========================================================================
+
+local function make_luban()
+  return {
+    version = 2,
+    log = function(level, message)
+      notifications[#notifications + 1] = "log:" .. level .. ":" .. message
+    end,
+    notify = function(message)
+      notifications[#notifications + 1] = message
+    end,
+    json = {
+      encode = function(value)
+        return json_encode(value)
+      end,
+      decode = function(text)
+        return json_decode(text)
+      end,
+    },
+    document = {
+      get = function()
+        return current_doc
+      end,
+      set_text = function(text, sel_start, sel_end)
+        updated_text = text
+        updated_selection = { sel_start, sel_end }
+        if not update_result then
+          error("update failed")
+        end
+        if current_doc then
+          current_doc.text = text
+        end
+        return nil
+      end,
+      insert = function(text)
+        if not current_doc then
+          error("unsupported document")
+        end
+        current_doc.text = current_doc.text .. text
+        return nil
+      end,
+      set_cursor = function(line, column)
+        cursor_calls[#cursor_calls + 1] = { line = line, column = column }
+        return nil
+      end,
+    },
+    settings = {
+      get = function(key)
+        if current_settings == nil then
+          return nil
+        end
+        return current_settings[key]
+      end,
+      set = function(key, value)
+        current_settings = current_settings or {}
+        current_settings[key] = value
+        return nil
+      end,
+    },
+    status = {
+      set = function(id, text)
+        return nil
+      end,
+    },
+    panel = {
+      open = function(id)
+        panel_opens[#panel_opens + 1] = id
+        notifications[#notifications + 1] = "open:" .. id
+        return nil
+      end,
+      refresh = function(id)
+        panel_refreshes[#panel_refreshes + 1] = id
+        notifications[#notifications + 1] = "refresh:" .. id
+        return nil
+      end,
+    },
+    command = {
+      run = function(id, args)
+        command_calls[#command_calls + 1] = { id = id, args = args }
+        return nil
+      end,
+    },
+    events = {
+      on = function(name, fn)
+        if type(fn) ~= "function" then
+          error("event handler must be a function")
+        end
+        handlers[name] = fn
+        return nil
+      end,
+      off = function(name)
+        handlers[name] = nil
+        return nil
+      end,
+    },
+    timer = {
+      after = function(ms, fn)
+        return "timer-after"
+      end,
+      every = function(ms, fn)
+        return "timer-every"
+      end,
+      cancel = function(id)
+        return nil
+      end,
+    },
+    fs = {
+      read = function(path)
+        local value = fs_files[path]
+        if value == nil then
+          error(path .. ": no such file")
+        end
+        return value
+      end,
+      write = function(path, text)
+        fs_writes[#fs_writes + 1] = { path = path, text = text }
+        fs_files[path] = text
+        return nil
+      end,
+    },
+    data_dir = function()
+      return "/data"
+    end,
+  }
+end
 
 local function reset_luban()
   current_doc = nil
@@ -22,34 +352,14 @@ local function reset_luban()
   updated_text = nil
   updated_selection = nil
   update_result = true
-  luban = {
-    log = function(level, message) end,
-    notify = function(message)
-      notifications[#notifications + 1] = message
-    end,
-    get_document = function()
-      return current_doc
-    end,
-    set_document_text = function(text, start, finish)
-      updated_text = text
-      updated_selection = { start, finish }
-      if update_result then
-        return true
-      end
-      return false, "update failed"
-    end,
-    settings = {
-      get = function(key)
-        return current_settings[key]
-      end,
-    },
-    panel = {
-      open = function(id)
-        notifications[#notifications + 1] = "open:" .. id
-        return true
-      end,
-    },
-  }
+  panel_opens = {}
+  panel_refreshes = {}
+  handlers = {}
+  fs_files = {}
+  fs_writes = {}
+  cursor_calls = {}
+  command_calls = {}
+  luban = make_luban()
 end
 
 reset_luban()
@@ -58,6 +368,11 @@ local ok, plugin = pcall(loadfile(PLUGIN_MAIN))
 assert(ok and type(plugin) == "table", "cannot load " .. PLUGIN_MAIN .. ": " .. tostring(plugin))
 local M = plugin
 local I = M._internals
+local T = require("json.tree")
+local PARSER = require("json.parser")
+local DISPLAY = require("json.display")
+local PATH = require("json.path")
+local META = require("json.meta")
 
 local PASSED = 0
 local FAILED = 0
@@ -120,6 +435,13 @@ local function check_panel(panel)
     if line.indent ~= nil then
       truthy(line.indent >= 0 and line.indent <= 8, "line " .. index .. " indent out of range")
     end
+    if line.command ~= nil then
+      truthy(type(line.command) == "table", "line " .. index .. " command is not a table")
+      truthy(type(line.command.id) == "string", "line " .. index .. " command id is not a string")
+      if line.command.args ~= nil then
+        truthy(type(line.command.args) == "table", "line " .. index .. " command args is not a table")
+      end
+    end
     if line.spans then
       truthy(#line.spans <= 512, "line " .. index .. " has too many spans")
       local parts = {}
@@ -130,17 +452,18 @@ local function check_panel(panel)
       eq(table.concat(parts), line.text, "line " .. index .. " spans do not match text")
     end
   end
+  if panel.actions ~= nil then
+    truthy(type(panel.actions) == "table", "panel.actions is not a table")
+    for index, action in ipairs(panel.actions) do
+      truthy(type(action.label) == "string", "action " .. index .. " label missing")
+      truthy(type(action.command) == "table", "action " .. index .. " command is not a table")
+      truthy(type(action.command.id) == "string", "action " .. index .. " command id missing")
+    end
+  end
 end
 
 local function reset_folds()
-  I.fold_state.doc_key = nil
-  I.fold_state.signature = nil
-  I.fold_state.level = nil
-  for path in pairs(I.fold_state.collapsed) do
-    I.fold_state.collapsed[path] = nil
-  end
-  I.fold_state.count = 0
-  I.fold_state.seeded = false
+  T.reset()
 end
 
 local function render(text, settings, keep_folds)
@@ -200,6 +523,15 @@ local function expect_error(text, needle)
   truthy(type(err) == "table" and err.json_error, "expected a JSON error table")
   contains(err.message, needle, "unexpected error message")
   return err
+end
+
+local function any_notification(needle)
+  for _, message in ipairs(notifications) do
+    if type(message) == "string" and message:find(needle, 1, true) then
+      return true
+    end
+  end
+  return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -461,28 +793,14 @@ test("empty and unsupported documents explain themselves", function()
   contains(panel.lines[1].text, "not available")
 end)
 
-test("the command opens the declared panel, with a menu fallback on old hosts", function()
+test("the preview command opens the declared panel", function()
   notifications = {}
   M.open_preview({})
   eq(notifications[#notifications], "open:json.preview.panel")
-  local original = luban.panel
-  luban.panel = nil
-  notifications = {}
-  M.open_preview({})
-  contains(notifications[#notifications], "Plugins menu")
-  luban.panel = original
+  eq(panel_opens[#panel_opens], "json.preview.panel")
 end)
 
-local function any_notification(needle)
-  for _, message in ipairs(notifications) do
-    if message:find(needle, 1, true) then
-      return true
-    end
-  end
-  return false
-end
-
-test("puts preview actions in the panel toolbar, not the Plugins menu", function()
+test("puts preview actions in the panel header, not the Plugins menu", function()
   local file = assert(io.open("plugin.json", "rb"))
   local text = file:read("*a")
   file:close()
@@ -514,16 +832,21 @@ test("puts preview actions in the panel toolbar, not the Plugins menu", function
   contains(menus, '"json.preview"', "preview menu entry missing")
 end)
 
-test("renders the three action rows and toggles all folds", function()
+test("tree lines carry per-node fold commands and toggle-all works", function()
   local text = '{"a":{"b":1},"c":[1,2]}'
   local panel = render(text)
-  eq(panel.lines[1].command, "json.fold.all")
-  contains(panel.lines[1].text, "[ Fold All ]")
-  eq(panel.lines[2].command, "json.path.action")
-  contains(panel.lines[2].text, "[ Show / Extract ]")
-  eq(panel.lines[3].command, "json.metadata")
-  contains(panel.lines[3].text, "[ Analyze ]")
-  eq(panel.lines[4].style, "rule")
+  eq(panel.lines[1].style, "rule", "preview should start with a rule, not toolbar rows")
+  local root_line = panel.lines[2]
+  truthy(root_line.command, "root container line carries no command")
+  eq(root_line.command.id, "json.fold.toggle", "root command id")
+  eq(root_line.command.args.path, "$", "root fold path")
+  local a_line = panel.lines[index_of(panel, '"a": {')]
+  truthy(a_line and a_line.command, "$.a line carries no command")
+  eq(a_line.command.id, "json.fold.toggle", "$.a command id")
+  eq(a_line.command.args.path, "$.a", "$.a fold path")
+  local c_line = panel.lines[index_of(panel, '"c": [')]
+  truthy(c_line and c_line.command, "$.c line carries no command")
+  eq(c_line.command.args.path, "$.c", "$.c fold path")
   current_doc = {
     path = "/tmp/test.json",
     text = text,
@@ -535,55 +858,47 @@ test("renders the three action rows and toggles all folds", function()
   notifications = {}
   M.toggle_all_folds({})
   truthy(any_notification("folded 2 nodes"), "toggle-all fold notification missing")
+  truthy(any_notification("refresh:json.preview.panel"), "toggle-all must refresh the preview panel")
   local folded = M.render_preview({})
-  contains(folded.lines[1].text, "[ Expand All ]")
-  eq(folded.lines[1].command, "json.fold.none")
   truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "nested node was not folded")
+  truthy(index_of(folded, '▸ "c": [ … 2 items ]') ~= nil, "array node was not folded")
   M.toggle_all_folds({})
   local expanded = M.render_preview({})
-  contains(expanded.lines[1].text, "[ Fold All ]")
   truthy(index_of(expanded, "▸") == nil, "toggle-all did not expand")
 end)
 
-test("uses compact header actions on hosts with panel API version 2", function()
-  local original = luban.panel
-  local ok, err = pcall(function()
-    luban.panel = { open = original.open, version = 2 }
-    local text = '{"a":{"b":1},"c":[1,2]}'
-    reset_folds()
-    current_doc = {
-      path = "/tmp/actions.json",
-      text = text,
-      line = 1,
-      column = 1,
-      selection_start = 0,
-      selection_end = 0,
-    }
-    current_settings = {}
-    local panel = M.render_preview({})
-    check_panel(panel)
-    eq(panel.lines[1].style, "rule")
-    truthy(panel.actions ~= nil, "panel actions missing")
-    eq(#panel.actions, 3)
-    eq(panel.actions[1].label, "Fold All")
-    eq(panel.actions[1].command, "json.fold.toggle-all")
-    eq(panel.actions[2].command, "json.path.action")
-    eq(panel.actions[3].command, "json.metadata")
-    truthy(index_of(panel, "[ Fold All ]") == nil, "fallback toolbar should be omitted")
-    truthy(index_of(panel, '▾ "a": {') ~= nil, "tree missing")
-    M.toggle_all_folds({})
-    local folded = M.render_preview({})
-    check_panel(folded)
-    eq(folded.actions[1].label, "Expand All")
-    truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "action fold missing")
-  end)
-  luban.panel = original
-  if not ok then
-    error(err)
-  end
+test("header actions replace the v1 toolbar rows", function()
+  local text = '{"a":{"b":1},"c":[1,2]}'
+  reset_folds()
+  current_doc = {
+    path = "/tmp/actions.json",
+    text = text,
+    line = 1,
+    column = 1,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  local panel = M.render_preview({})
+  check_panel(panel)
+  truthy(panel.actions ~= nil, "panel actions missing")
+  eq(#panel.actions, 3)
+  eq(panel.actions[1].label, "Fold All")
+  eq(panel.actions[1].command.id, "json.fold.toggle-all")
+  eq(panel.actions[2].command.id, "json.path.action")
+  eq(panel.actions[3].command.id, "json.metadata")
+  truthy(index_of(panel, "[ Fold All ]") == nil, "v1 toolbar rows should be gone")
+  truthy(index_of(panel, "[ Show / Extract ]") == nil, "v1 toolbar rows should be gone")
+  truthy(index_of(panel, "[ Analyze ]") == nil, "v1 toolbar rows should be gone")
+  truthy(index_of(panel, '▾ "a": {') ~= nil, "tree missing")
+  M.toggle_all_folds({})
+  local folded = M.render_preview({})
+  check_panel(folded)
+  eq(folded.actions[1].label, "Expand All")
+  truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "action fold missing")
 end)
 
-test("the toolbar JSONPath action follows the editor selection", function()
+test("the header JSONPath action follows the editor selection", function()
   local expression = "$.users[0].name"
   local text = '{"query":"' .. expression .. '","users":[{"name":"Ada"}]}'
   local byte_start = assert(text:find(expression, 1, true))
@@ -641,6 +956,7 @@ test("folds and expands the node containing the cursor", function()
   notifications = {}
   M.toggle_fold({})
   truthy(any_notification("folded $.a"), "fold notification missing")
+  truthy(any_notification("refresh:json.preview.panel"), "toggle must refresh the preview panel")
   local folded = M.render_preview({})
   check_panel(folded)
   truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "collapsed line missing")
@@ -858,6 +1174,275 @@ test("folds, analyzes and queries JSON Lines records", function()
   local results = I.render_jsonpath_results(analysis, "$.b.c")
   check_panel(results)
   truthy(index_of(results, "Line 2 · $.b.c = 2") ~= nil, "JSON Lines JSONPath result missing")
+end)
+
+-- ---------------------------------------------------------------------------
+-- v2 additions: modules, per-node fold commands, fold persistence
+-- ---------------------------------------------------------------------------
+
+test("all json modules load through the v2 require surface", function()
+  truthy(type(PARSER) == "table", "json.parser did not load")
+  truthy(type(PARSER.parse) == "function", "json.parser.parse missing")
+  truthy(type(PARSER.compute_line_starts) == "function", "json.parser.compute_line_starts missing")
+  truthy(type(PARSER.line_number_at) == "function", "json.parser.line_number_at missing")
+  truthy(type(PARSER.locate) == "function", "json.parser.locate missing")
+  eq(PARSER.MAX_DEPTH, 256, "parser depth cap")
+  truthy(type(DISPLAY) == "table", "json.display did not load")
+  truthy(type(DISPLAY.encode_string) == "function", "json.display.encode_string missing")
+  truthy(type(DISPLAY.display_string) == "function", "json.display.display_string missing")
+  truthy(type(DISPLAY.describe_node) == "function", "json.display.describe_node missing")
+  truthy(type(DISPLAY.ordered_pairs) == "function", "json.display.ordered_pairs missing")
+  truthy(type(PATH) == "table", "json.path did not load")
+  truthy(type(PATH.parse_jsonpath) == "function", "json.path.parse_jsonpath missing")
+  truthy(type(PATH.evaluate_jsonpath) == "function", "json.path.evaluate_jsonpath missing")
+  truthy(type(PATH.locate_node) == "function", "json.path.locate_node missing")
+  truthy(type(PATH.sub_chars) == "function", "json.path.sub_chars missing")
+  truthy(type(T) == "table", "json.tree did not load")
+  truthy(type(T.render_document) == "function", "json.tree.render_document missing")
+  truthy(type(T.ensure_fold_state) == "function", "json.tree.ensure_fold_state missing")
+  truthy(type(T.load_state) == "function", "json.tree.load_state missing")
+  truthy(type(T.fold_state) == "table", "json.tree.fold_state missing")
+  truthy(type(META) == "table", "json.meta did not load")
+  truthy(type(META.statistics) == "function", "json.meta.statistics missing")
+  truthy(type(M)._modules == nil or type(M._modules) == "table", "module map malformed")
+end)
+
+test("a clicked tree line toggles its fold through the args path", function()
+  local text = '{"a":{"b":1},"c":[1,2]}'
+  local panel = render(text)
+  local target = nil
+  for _, line in ipairs(panel.lines) do
+    if line.command and line.command.args and line.command.args.path == "$.a" then
+      target = line
+    end
+  end
+  truthy(target, "no tree line carries the $.a fold command")
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  notifications = {}
+  -- No cursor fields at all: the args path must be sufficient.
+  M.toggle_fold({}, { path = target.command.args.path })
+  truthy(any_notification("folded $.a"), "args fold notification missing")
+  local folded = M.render_preview({})
+  check_panel(folded)
+  truthy(index_of(folded, '▸ "a": { … 1 key }') ~= nil, "args fold did not collapse the node")
+  truthy(index_of(folded, '▾ "c": [') ~= nil, "unrelated container must stay expanded")
+  M.toggle_fold({}, { path = "$.a" })
+  local expanded = M.render_preview({})
+  truthy(index_of(expanded, '▾ "a": {') ~= nil, "args toggle did not expand")
+end)
+
+test("fold state survives re-renders in memory", function()
+  local text = '{"a":{"b":1}}'
+  render(text)
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  M.toggle_fold({}, { path = "$.a" })
+  local first = M.render_preview({})
+  truthy(index_of(first, '▸ "a": { … 1 key }') ~= nil, "fold missing after the first render")
+  for _ = 1, 3 do
+    local again = M.render_preview({})
+    truthy(index_of(again, '▸ "a": { … 1 key }') ~= nil, "fold did not survive a re-render")
+  end
+  eq(T.fold_state.count, 1, "fold count drifted")
+end)
+
+test("fold changes are written through to state.json", function()
+  local text = '{"a":{"b":1}}'
+  render(text)
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  fs_writes = {}
+  M.toggle_fold({}, { path = "$.a" })
+  truthy(#fs_writes > 0, "fold change was not written through")
+  local write = fs_writes[#fs_writes]
+  eq(write.path, "state.json", "unexpected persistence path")
+  local data = json_decode(write.text)
+  eq(data.doc_key, "/tmp/test.json", "persisted doc key")
+  eq(data.version, 1, "persisted state version")
+  eq(data.level, 0, "persisted fold level")
+  eq(data.seeded, true, "persisted seeded flag")
+  truthy(type(data.collapsed) == "table" and data.collapsed[1] == "$.a", "persisted fold paths")
+  -- Expanding writes the empty state back out.
+  M.toggle_fold({}, { path = "$.a" })
+  local data_after = json_decode(fs_writes[#fs_writes].text)
+  eq(#data_after.collapsed, 0, "expanding must clear the persisted folds")
+end)
+
+test("activate restores fold state from state.json", function()
+  local text = '{"a":{"b":1},"c":[1,2]}'
+  render(text)
+  local signature = T.fold_state.signature
+  local doc_key = T.fold_state.doc_key
+  truthy(type(signature) == "string" and signature ~= "", "root signature missing")
+  reset_folds()
+  fs_files = {}
+  fs_files["state.json"] = json_encode({
+    version = 1,
+    doc_key = doc_key,
+    signature = signature,
+    level = 0,
+    seeded = true,
+    collapsed = { "$.a" },
+  })
+  notifications = {}
+  M.activate({})
+  truthy(T.fold_state.collapsed["$.a"] == true, "state.json was not restored at activate")
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  local panel = M.render_preview({})
+  truthy(index_of(panel, '▸ "a": { … 1 key }') ~= nil, "restored fold was not applied")
+  truthy(index_of(panel, '▸ "c": [ … 2 items ]') == nil, "an unrestored fold must not appear")
+end)
+
+test("activate tolerates a missing or corrupt state.json and registers on_edit", function()
+  reset_folds()
+  fs_files = {}
+  notifications = {}
+  handlers["on_edit"] = nil
+  M.activate({})
+  truthy(handlers["on_edit"] == M.on_edit, "activate must register the on_edit handler")
+  truthy(next(T.fold_state.collapsed) == nil, "fold state should start empty")
+  fs_files["state.json"] = "{not json at all"
+  M.activate({})
+  truthy(next(T.fold_state.collapsed) == nil, "a corrupt state file must be ignored")
+end)
+
+test("on_edit resets fold state on structural edits, switches and tab closes", function()
+  local text = '{"a":{"b":1}}'
+  render(text)
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  M.toggle_fold({}, { path = "$.a" })
+  truthy(T.fold_state.collapsed["$.a"], "setup fold missing")
+  -- A same-document edit keeps the folds; the signature check happens later.
+  M.on_edit(current_doc)
+  truthy(T.fold_state.collapsed["$.a"], "same-document edit must keep folds")
+  -- A structural edit resets the folds on the next render.
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = '{"a":{"b":1},"z":9}',
+    selection_start = 0,
+    selection_end = 0,
+  }
+  M.on_edit(current_doc)
+  local panel = M.render_preview({})
+  truthy(index_of(panel, '▾ "a": {') ~= nil, "render after a structural edit must show the tree expanded")
+  truthy(next(T.fold_state.collapsed) == nil, "structural edit must reset folds")
+  -- Switching documents drops the state immediately.
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  M.toggle_fold({}, { path = "$.a" })
+  truthy(T.fold_state.collapsed["$.a"], "setup fold missing")
+  M.on_edit({ path = "/tmp/other.json", text = "{}" })
+  truthy(next(T.fold_state.collapsed) == nil, "document switch must reset folds")
+  -- A closed tab clears the state too.
+  current_doc = {
+    path = "/tmp/test.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  M.toggle_fold({}, { path = "$.a" })
+  M.on_edit(nil)
+  truthy(next(T.fold_state.collapsed) == nil, "tab close must reset folds")
+end)
+
+test("fold paths stay exact: the 2 KiB state path cap is gone", function()
+  local key = string.rep("k", 2100)
+  local text = '{"' .. key .. '":{"x":1}}'
+  local panel = render(text)
+  local target = nil
+  for _, line in ipairs(panel.lines) do
+    if line.command and line.command.args and line.command.args.path
+      and #line.command.args.path > 2048 then
+      target = line.command.args.path
+    end
+  end
+  truthy(target, "nested container line missing its fold command")
+  truthy(#target > 2048, "fold path was shortened; the state cap must be gone")
+  eq(target, "$." .. key, "fold path must be the exact structural path")
+  current_doc = {
+    path = "/tmp/long.json",
+    language = "JSON",
+    text = text,
+    selection_start = 0,
+    selection_end = 0,
+  }
+  current_settings = {}
+  M.toggle_fold({}, { path = target })
+  truthy(T.fold_state.collapsed[target] == true, "the exact long path must be stored")
+  local folded = M.render_preview({})
+  truthy(index_of(folded, "… 1 key }") ~= nil, "long-path fold was not applied")
+end)
+
+test("activate rejects pre-v2 hosts and the v1 fallback code is gone", function()
+  reset_folds()
+  handlers["on_edit"] = nil
+  local original_version = luban.version
+  luban.version = 1
+  local ok_run, error_message = pcall(M.activate, {})
+  truthy(not ok_run, "activate must reject pre-v2 hosts")
+  contains(tostring(error_message), "v2", "error message must mention v2")
+  luban.version = original_version
+  truthy(handlers["on_edit"] == nil, "no handler before activation")
+  -- No v1 host detection, no v1 document mutators, no panel-clear workarounds.
+  local sources = {}
+  for _, name in ipairs({
+    "main.lua", "json/parser.lua", "json/display.lua", "json/path.lua", "json/tree.lua", "json/meta.lua",
+  }) do
+    local file = assert(io.open(name, "rb"))
+    sources[#sources + 1] = file:read("*a")
+    file:close()
+  end
+  local joined = table.concat(sources)
+  for _, legacy in ipairs({
+    "luban.panel.version",
+    "luban.get_document",
+    "set_document_text",
+    "panel_supports_actions",
+    "push_toolbar",
+    "toolbar_line",
+  }) do
+    truthy(not joined:find(legacy, 1, true), "v1 workaround still present: " .. legacy)
+  end
 end)
 
 io.write(string.format("\n%d passed, %d failed\n", PASSED, FAILED))

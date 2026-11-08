@@ -1,13 +1,18 @@
 {
   "id": "io.github.yyn0210.json-preview",
   "name": "JSON Preview",
-  "version": "1.2.0",
-  "api_version": 1,
+  "version": "2.0.0",
+  "api_version": 2,
   "main": "main.lua",
   "description": "Tree-style JSON preview with node folding, JSONPath extraction, metadata analysis, syntax colors, error locations, duplicate-key hints, JSON Lines support and format/minify/validate commands.",
   "author": "yyn0210",
-  "permissions": [],
+  "permissions": [
+    "filesystem"
+  ],
   "activate": "activate",
+  "events": [
+    "on_edit"
+  ],
   "contributes": {
     "commands": [
       {
