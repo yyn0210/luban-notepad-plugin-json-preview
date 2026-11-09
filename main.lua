@@ -45,6 +45,22 @@ local parse_json = P.parse
 local compute_line_starts = P.compute_line_starts
 local locate = P.locate
 
+-- Older hosts do not expose luban.i18n; they keep the English titles.
+local function pick(english, chinese)
+  if luban.i18n and luban.i18n.pick then
+    return luban.i18n.pick({ en = english, ["zh-CN"] = chinese })
+  end
+  return english
+end
+
+local function preview_title()
+  return pick("JSON Preview", "JSON 预览")
+end
+
+local function inspector_title()
+  return pick("JSON Inspector", "JSON 检查器")
+end
+
 local char_offset_at = J.char_offset_at
 local byte_offset_at = J.byte_offset_at
 local sub_chars = J.sub_chars
@@ -334,7 +350,7 @@ local function render_jsonpath_error(expression, err)
   local shown = clip_text(expression, 300)
   local caret = math.max(0, math.min(pos - 1, #shown))
   MT.metadata_line(lines, string.rep(" ", caret) .. "^", "code")
-  return { title = "JSONPath", lines = lines }
+  return { title = pick("JSONPath", "JSONPath"), lines = lines }
 end
 
 local function render_jsonpath_results(analysis, expression)
@@ -383,7 +399,7 @@ local function render_jsonpath_results(analysis, expression)
   MT.metadata_line(lines, "Matches     " .. match_text, "muted")
   if total == 0 then
     MT.metadata_line(lines, "No values match this expression.", "muted")
-    return { title = "JSONPath", lines = lines }
+    return { title = pick("JSONPath", "JSONPath"), lines = lines }
   end
   local shown = math.min(#results, MAX_JSONPATH_DISPLAY)
   for index = 1, shown do
@@ -405,7 +421,7 @@ local function render_jsonpath_results(analysis, expression)
   if truncated then
     MT.metadata_line(lines, string.format("Evaluation stopped after %d matches.", MAX_JSONPATH_MATCHES), "muted")
   end
-  return { title = "JSONPath", lines = lines }
+  return { title = pick("JSONPath", "JSONPath"), lines = lines }
 end
 
 local function find_jsonpath_match(root, path)
@@ -429,7 +445,7 @@ local function render_path_at(analysis, path, line, type_text, value_text)
     end
     if not root then
       MT.metadata_line(lines, "The cursor is not on a JSON Lines record.", "muted")
-      return { title = "JSONPath at Cursor", lines = lines }
+      return { title = pick("JSONPath at Cursor", "光标处的 JSONPath"), lines = lines }
     end
   end
   local prefix = (analysis.kind == "jsonl" and line) and string.format("Line %d · ", line) or ""
@@ -439,14 +455,14 @@ local function render_path_at(analysis, path, line, type_text, value_text)
     if not match then
       local message = type(err) == "table" and err.message or "The path no longer resolves."
       MT.metadata_line(lines, message, "muted")
-      return { title = "JSONPath at Cursor", lines = lines }
+      return { title = pick("JSONPath at Cursor", "光标处的 JSONPath"), lines = lines }
     end
     type_text = describe_node(match.node)
     value_text = value_preview(match.node, 240)
   end
   MT.metadata_line(lines, "Type   " .. type_text, "muted")
   MT.metadata_line(lines, "Value  " .. value_text, "code")
-  return { title = "JSONPath at Cursor", lines = lines }
+  return { title = pick("JSONPath at Cursor", "光标处的 JSONPath"), lines = lines }
 end
 
 -- ===========================================================================
@@ -480,11 +496,11 @@ function M.render_inspector(ctx)
         end
         local ok, root = pcall(parse_json, text)
         if not ok and type(root) == "table" and root.json_error then
-          return { title = "JSON Inspector", lines = T.render_error(text, root, truncated) }
+          return { title = inspector_title(), lines = T.render_error(text, root, truncated) }
         end
       end
       return {
-        title = "JSON Inspector",
+        title = inspector_title(),
         lines = { { text = "The document cannot be analyzed; see the status message.", style = "muted" } },
       }
     end
@@ -505,7 +521,7 @@ function M.render_inspector(ctx)
   if not ok then
     luban.log("error", "json inspector failed: " .. tostring(result))
     return {
-      title = "JSON Inspector",
+      title = inspector_title(),
       lines = { { text = "Inspector failed: " .. tostring(result), style = "muted" } },
     }
   end
@@ -524,7 +540,7 @@ function M.render_preview(ctx)
   local doc = active_document()
   if not doc then
     return {
-      title = "JSON Preview",
+      title = preview_title(),
       lines = { { text = "Preview is not available for this document.", style = "muted" } },
     }
   end
@@ -533,7 +549,7 @@ function M.render_preview(ctx)
   if not ok then
     luban.log("error", "json preview failed: " .. tostring(result))
     return {
-      title = "JSON Preview",
+      title = preview_title(),
       lines = { { text = "Preview failed: " .. tostring(result), style = "muted" } },
     }
   end

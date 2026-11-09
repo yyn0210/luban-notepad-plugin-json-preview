@@ -395,13 +395,20 @@ local function fold_command(fold_path)
 end
 
 local function build_panel_actions(folded)
+  local toggle = folded > 0 and "Expand All" or "Fold All"
+  local toggle_zh = folded > 0 and "全部展开" or "全部折叠"
   return {
     {
-      label = folded > 0 and "Expand All" or "Fold All",
+      label = toggle,
+      label_i18n = { ["zh-CN"] = toggle_zh },
       command = { id = "json.fold.toggle-all" },
     },
     { label = "JSONPath", command = { id = "json.path.action" } },
-    { label = "Metadata", command = { id = "json.metadata" } },
+    {
+      label = "Metadata",
+      label_i18n = { ["zh-CN"] = "元数据" },
+      command = { id = "json.metadata" },
+    },
   }
 end
 
@@ -733,16 +740,20 @@ local function document_title(doc, description)
   if type(path) == "string" and path ~= "" then
     name = path:match("([^/\\]+)$") or path
   end
+  local preview = "JSON Preview"
+  if luban.i18n and luban.i18n.pick then
+    preview = luban.i18n.pick({ en = "JSON Preview", ["zh-CN"] = "JSON 预览" })
+  end
   if name then
     if description then
       return name .. " — " .. description
     end
-    return name .. " — JSON Preview"
+    return name .. " — " .. preview
   end
   if description then
     return description
   end
-  return "JSON Preview"
+  return preview
 end
 
 local function render_document(doc, opts)

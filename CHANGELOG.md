@@ -1,5 +1,12 @@
 # 更新日志
 
+## 未发布
+
+- 新增中文翻译：清单 `localizations` 覆盖插件名称、描述、命令标签/说明、
+  面板标题（预览/检查器）和设置；预览工具栏的 Fold All/JSONPath/Metadata
+  按钮通过 `label_i18n` 显示中文，标题通过 `luban.i18n.pick` 跟随界面语言。
+  老宿主忽略这些加性字段并继续显示英文。
+
 ## 2.0.0 — 2026-11-08
 
 面向插件 API v2（`luban.version >= 2`，清单 `api_version: 2`）的重写。

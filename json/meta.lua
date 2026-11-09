@@ -297,7 +297,11 @@ local function render_metadata(analysis)
   if analysis.truncated then
     metadata_line(lines, "The document is larger than 512 KiB; only the first 512 KiB were analyzed.", "muted")
   end
-  return { title = "JSON Metadata", lines = lines }
+  local title = "JSON Metadata"
+  if luban.i18n and luban.i18n.pick then
+    title = luban.i18n.pick({ en = "JSON Metadata", ["zh-CN"] = "JSON 元数据" })
+  end
+  return { title = title, lines = lines }
 end
 
 M.statistics = render_metadata

@@ -189,5 +189,95 @@
         "max_length": 1024
       }
     ]
+  },
+  "localizations": {
+    "zh-CN": {
+      "name": "JSON 预览",
+      "description": "树形 JSON 预览：节点折叠、JSONPath 提取、元数据分析、语法着色、错误定位、重复键提示、JSON Lines 支持，以及格式化/压缩/校验命令。",
+      "commands": {
+        "json.preview": {
+          "label": "JSON：预览",
+          "description": "打开或刷新 JSON 预览"
+        },
+        "json.fold.toggle": {
+          "label": "JSON：折叠/展开",
+          "description": "折叠或展开光标所在的对象或数组"
+        },
+        "json.fold.all": {
+          "label": "JSON：全部折叠",
+          "description": "折叠预览中的所有嵌套对象和数组"
+        },
+        "json.fold.none": {
+          "label": "JSON：全部展开",
+          "description": "展开预览中所有已折叠的对象和数组"
+        },
+        "json.fold.toggle-all": {
+          "label": "JSON：切换全部折叠",
+          "description": "从预览工具栏折叠或展开所有嵌套容器"
+        },
+        "json.path.show": {
+          "label": "JSON：显示 JSONPath",
+          "description": "显示光标处值的 JSONPath"
+        },
+        "json.path.extract": {
+          "label": "JSON：提取 JSONPath",
+          "description": "在检查器中求值选中的 JSONPath 表达式，或配置的表达式"
+        },
+        "json.path.action": {
+          "label": "JSON：光标处或选区的 JSONPath",
+          "description": "显示光标处的路径，或提取选中的 JSONPath 表达式"
+        },
+        "json.metadata": {
+          "label": "JSON：元数据",
+          "description": "分析值的数量、深度、重复键、字符串和数字"
+        },
+        "json.format": {
+          "label": "JSON：格式化文档",
+          "description": "美化当前 JSON 文档"
+        },
+        "json.minify": {
+          "label": "JSON：压缩文档",
+          "description": "压缩当前 JSON 文档"
+        },
+        "json.validate": {
+          "label": "JSON：校验",
+          "description": "检查当前文档并报告 JSON 问题"
+        }
+      },
+      "panels": {
+        "json.preview.panel": {
+          "title": "JSON 预览"
+        },
+        "json.inspector.panel": {
+          "title": "JSON 检查器"
+        }
+      },
+      "settings": {
+        "indent": {
+          "label": "缩进宽度",
+          "description": "预览和格式化文档中每层嵌套的空格数。"
+        },
+        "sort_keys": {
+          "label": "预览中排序键",
+          "description": "仅在预览中按字母顺序排列对象键；格式化保留原始顺序。"
+        },
+        "json_lines": {
+          "label": "预览 JSON Lines",
+          "description": "当文档不是单个 JSON 值时，如果每一行都是有效 JSON，则把每个非空行预览为一条记录。"
+        },
+        "fold_level": {
+          "label": "初始折叠层级",
+          "description": "0 表示全部展开。1 只展开根，2 还展开其直接容器，依此类推。"
+        },
+        "show_paths": {
+          "label": "在预览行显示 JSONPath",
+          "description": "在每个值的预览行后附加其 JSONPath。"
+        },
+        "jsonpath": {
+          "label": "JSONPath 表达式",
+          "description": "未选中文本时，由「JSON：提取 JSONPath」使用。"
+        }
+      }
+    }
   }
 }

@@ -224,6 +224,17 @@ end
 local function make_luban()
   return {
     version = 2,
+    i18n = {
+      locale = function()
+        return "en"
+      end,
+      pick = function(value)
+        if type(value) == "table" then
+          return value.en or value["zh-CN"] or next(value)
+        end
+        return value
+      end,
+    },
     log = function(level, message)
       notifications[#notifications + 1] = "log:" .. level .. ":" .. message
     end,
@@ -455,7 +466,11 @@ local function check_panel(panel)
   if panel.actions ~= nil then
     truthy(type(panel.actions) == "table", "panel.actions is not a table")
     for index, action in ipairs(panel.actions) do
-      truthy(type(action.label) == "string", "action " .. index .. " label missing")
+      truthy(
+        type(action.label) == "string"
+          or (type(action.label) == "table" and type(action.label.en) == "string"),
+        "action " .. index .. " label missing"
+      )
       truthy(type(action.command) == "table", "action " .. index .. " command is not a table")
       truthy(type(action.command.id) == "string", "action " .. index .. " command id missing")
     end
@@ -884,6 +899,7 @@ test("header actions replace the v1 toolbar rows", function()
   truthy(panel.actions ~= nil, "panel actions missing")
   eq(#panel.actions, 3)
   eq(panel.actions[1].label, "Fold All")
+  eq(panel.actions[1].label_i18n["zh-CN"], "全部折叠")
   eq(panel.actions[1].command.id, "json.fold.toggle-all")
   eq(panel.actions[2].command.id, "json.path.action")
   eq(panel.actions[3].command.id, "json.metadata")
